@@ -560,4 +560,1053 @@ def calculate_pressure(self) -> float:
 
 ---
 
+## Память контекста и её реализация
+
+### Проблема контекстной памяти
+
+Человеческое мышление опирается на несколько типов памяти, которые взаимодействуют между собой:
+
+1. **Сенсорная память** (≈200-500 мс) - буфер сырых впечатлений
+2. **Кратковременная память** (≈30 сек) - активное удержание информации
+3. **Рабочая память** (7±2 элемента) - место для манипуляций с данными
+4. **Долговременная память** (годы) - устойчивое хранилище опыта
+
+Для симуляции мышления критически важно реализовать все уровни памяти с правильным взаимодействием между ними.
+
+---
+
+### Архитектура памяти для бота
+
+#### 1. Буфер сенсорной памяти (Sensory Buffer)
+
+**Назначение:** Временное хранение необработанных входящих сообщений с метаданными
+
+```python
+class SensoryBuffer:
+    def __init__(self, retention_time=1.0):
+        self.buffer = deque(maxlen=10)  # Последние 10 стимулов
+        self.retention_time = retention_time  # Время жизни в секундах
+
+    def add_stimulus(self, message: str, metadata: dict):
+        """Добавить сырой стимул с временной меткой"""
+        stimulus = {
+            "raw_text": message,
+            "timestamp": time.time(),
+            "metadata": metadata,  # Тон, длина, эмодзи и т.д.
+            "processed": False
+        }
+        self.buffer.append(stimulus)
+
+    async def decay_old_stimuli(self):
+        """Удаление устаревших необработанных стимулов"""
+        while True:
+            await asyncio.sleep(0.1)
+            current_time = time.time()
+
+            # Удалить стимулы старше retention_time
+            self.buffer = deque(
+                [s for s in self.buffer
+                 if current_time - s["timestamp"] < self.retention_time],
+                maxlen=self.buffer.maxlen
+            )
+```
+
+**Применение:**
+- Сырые сообщения хранятся 1 секунду до обработки
+- Слишком быстрый поток сообщений не перегружает систему
+- Возможность "передумать" до анализа стимула
+
+---
+
+#### 2. Кратковременная память (Short-term Memory)
+
+**Назначение:** Контекст последних N сообщений с эмоциональными метками
+
+```python
+class ShortTermMemory:
+    def __init__(self, capacity=5):
+        self.memory = deque(maxlen=capacity)
+        self.decay_rate = 0.9  # Затухание старых воспоминаний
+
+    def store(self, message: str, states: Dict[str, float], response: str = None):
+        """Сохранить обработанное сообщение с контекстом"""
+        memory_item = {
+            "timestamp": time.time(),
+            "message": message,
+            "detected_states": states.copy(),
+            "bot_response": response,
+            "importance": self.calculate_importance(states)
+        }
+        self.memory.append(memory_item)
+
+    def calculate_importance(self, states: Dict[str, float]) -> float:
+        """Важность = пиковая активация * разнообразие состояний"""
+        if not states:
+            return 0.0
+
+        peak = max(states.values())
+        diversity = len([v for v in states.values() if v > 0.3])
+        return peak * (1 + diversity * 0.1)
+
+    def recall_recent(self, state_name: str) -> List[dict]:
+        """Вспомнить последние случаи активации состояния"""
+        return [item for item in self.memory
+                if state_name in item["detected_states"]]
+
+    def get_emotional_context(self) -> Dict[str, float]:
+        """Средний эмоциональный фон последних сообщений"""
+        if not self.memory:
+            return {}
+
+        aggregated = {}
+        for i, item in enumerate(self.memory):
+            # Более свежие воспоминания имеют больший вес
+            weight = self.decay_rate ** (len(self.memory) - i - 1)
+
+            for state, activation in item["detected_states"].items():
+                if state in aggregated:
+                    aggregated[state] += activation * weight
+                else:
+                    aggregated[state] = activation * weight
+
+        # Нормализация
+        total = sum(aggregated.values())
+        if total > 0:
+            return {k: v/total for k, v in aggregated.items()}
+        return {}
+```
+
+**Применение:**
+- Хранит последние 5 диалогов с эмоциональным контекстом
+- Более важные моменты влияют на текущее состояние сильнее
+- Позволяет "помнить" тон разговора
+
+---
+
+#### 3. Рабочая память (Working Memory)
+
+**Назначение:** Активные "мысли" для текущей обработки
+
+```python
+class WorkingMemory:
+    def __init__(self, slots=7):
+        self.slots = slots  # Магическое число Миллера: 7±2
+        self.active_thoughts = []  # Список активных мыслей
+        self.attention_focus = None  # Текущий фокус внимания
+
+    def update(self, active_states: Dict[str, float], world_model):
+        """Обновление рабочей памяти из активных состояний"""
+        # Отсортировать состояния по активации
+        sorted_states = sorted(active_states.items(),
+                              key=lambda x: x[1],
+                              reverse=True)
+
+        # Взять топ-N самых активных
+        top_states = sorted_states[:self.slots]
+
+        # Создать "мысли" - связка состояния + ассоциации
+        self.active_thoughts = []
+        for state_name, activation in top_states:
+            thought = {
+                "state": state_name,
+                "activation": activation,
+                "associations": world_model.find_associations(state_name),
+                "timestamp": time.time()
+            }
+            self.active_thoughts.append(thought)
+
+        # Фокус внимания на самой активной мысли
+        if self.active_thoughts:
+            self.attention_focus = self.active_thoughts[0]
+
+    def get_focused_state(self) -> str:
+        """Получить состояние в фокусе внимания"""
+        if self.attention_focus:
+            return self.attention_focus["state"]
+        return None
+
+    def shift_attention(self, target_state: str):
+        """Переключить внимание на другое состояние"""
+        for thought in self.active_thoughts:
+            if thought["state"] == target_state:
+                self.attention_focus = thought
+                return True
+        return False
+
+    def get_active_associations(self) -> List[str]:
+        """Получить все ассоциации из рабочей памяти"""
+        all_assoc = []
+        for thought in self.active_thoughts:
+            all_assoc.extend(thought["associations"])
+        return list(set(all_assoc))  # Уникальные
+```
+
+**Применение:**
+- В каждый момент "осознаются" только 7±2 состояния
+- Ассоциации формируются только для состояний в рабочей памяти
+- Переключение внимания между мыслями
+
+---
+
+#### 4. Долговременная память (Long-term Memory)
+
+**Назначение:** Постоянное хранилище опыта, образов, ассоциаций
+
+##### Структура `memory/long_term.json`
+
+```json
+{
+  "episodes": [
+    {
+      "id": "episode_001",
+      "timestamp": "2024-01-15T10:30:00",
+      "context": "Обсуждение утренней рутины",
+      "key_states": ["Очарование", "Уточнение"],
+      "summary": "Пользователь рассказал о своём утре",
+      "emotional_valence": 0.7,
+      "importance": 0.85,
+      "retrieval_count": 3
+    }
+  ],
+  "semantic_memories": [
+    {
+      "concept": "кофе",
+      "definition": "утренний напиток, стимулятор",
+      "associations": ["утро", "энергия", "ритуал"],
+      "emotional_tags": ["Очарование", "Привычка"],
+      "first_encountered": "2024-01-15T08:00:00",
+      "strength": 0.92
+    }
+  ],
+  "procedural_memories": [
+    {
+      "pattern": "greeting_response",
+      "trigger": "приветствие пользователя",
+      "action": "активировать Очарование + дружелюбный ответ",
+      "success_rate": 0.88,
+      "usage_count": 15
+    }
+  ]
+}
+```
+
+##### Реализация долговременной памяти
+
+```python
+class LongTermMemory:
+    def __init__(self, storage_path="memory/"):
+        self.storage_path = storage_path
+        self.episodes = []
+        self.semantic = {}
+        self.procedural = {}
+        self.load_from_disk()
+
+    def consolidate_from_short_term(self, stm: ShortTermMemory):
+        """Перенос важных воспоминаний из кратковременной в долговременную"""
+        for item in stm.memory:
+            if item["importance"] > 0.7:  # Порог важности
+                episode = {
+                    "id": self.generate_id(),
+                    "timestamp": item["timestamp"],
+                    "context": item["message"],
+                    "key_states": list(item["detected_states"].keys()),
+                    "emotional_valence": self.calculate_valence(item["detected_states"]),
+                    "importance": item["importance"],
+                    "retrieval_count": 0
+                }
+                self.episodes.append(episode)
+
+    def retrieve_similar_episodes(self, current_states: Dict[str, float], k=3) -> List[dict]:
+        """Поиск похожих эпизодов по эмоциональному контексту"""
+        if not self.episodes:
+            return []
+
+        # Вычислить similarity score
+        scored_episodes = []
+        for episode in self.episodes:
+            similarity = self.compute_state_similarity(
+                current_states,
+                episode["key_states"]
+            )
+            scored_episodes.append((episode, similarity))
+
+        # Сортировка по убыванию схожести
+        scored_episodes.sort(key=lambda x: x[1], reverse=True)
+
+        # Вернуть топ-k
+        retrieved = [ep for ep, score in scored_episodes[:k]]
+
+        # Обновить счётчики извлечения
+        for ep in retrieved:
+            ep["retrieval_count"] += 1
+
+        return retrieved
+
+    def compute_state_similarity(self, states_a: Dict[str, float], states_b: List[str]) -> float:
+        """Косинусная схожесть между наборами состояний"""
+        # Создать векторы
+        all_states = set(states_a.keys()) | set(states_b)
+
+        vec_a = [states_a.get(s, 0.0) for s in all_states]
+        vec_b = [1.0 if s in states_b else 0.0 for s in all_states]
+
+        # Косинусная схожесть
+        dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
+        norm_a = sum(a ** 2 for a in vec_a) ** 0.5
+        norm_b = sum(b ** 2 for b in vec_b) ** 0.5
+
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+
+        return dot_product / (norm_a * norm_b)
+
+    def add_semantic_memory(self, concept: str, definition: str,
+                           associations: List[str], emotional_tags: List[str]):
+        """Добавить новый концепт в семантическую память"""
+        self.semantic[concept] = {
+            "definition": definition,
+            "associations": associations,
+            "emotional_tags": emotional_tags,
+            "first_encountered": time.time(),
+            "strength": 0.5  # Начальная сила
+        }
+
+    def strengthen_memory(self, concept: str, amount=0.1):
+        """Укрепление памяти при повторном использовании"""
+        if concept in self.semantic:
+            current = self.semantic[concept]["strength"]
+            self.semantic[concept]["strength"] = min(1.0, current + amount)
+
+    async def periodic_consolidation(self, stm: ShortTermMemory, interval=300):
+        """Периодическая консолидация памяти (каждые 5 минут)"""
+        while True:
+            await asyncio.sleep(interval)
+            self.consolidate_from_short_term(stm)
+            self.save_to_disk()
+
+    def save_to_disk(self):
+        """Сохранить долговременную память на диск"""
+        data = {
+            "episodes": self.episodes,
+            "semantic_memories": [
+                {"concept": k, **v} for k, v in self.semantic.items()
+            ],
+            "procedural_memories": [
+                {"pattern": k, **v} for k, v in self.procedural.items()
+            ]
+        }
+
+        with open(f"{self.storage_path}/long_term.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load_from_disk(self):
+        """Загрузить долговременную память с диска"""
+        try:
+            with open(f"{self.storage_path}/long_term.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.episodes = data.get("episodes", [])
+                self.semantic = {m["concept"]: m for m in data.get("semantic_memories", [])}
+                self.procedural = {m["pattern"]: m for m in data.get("procedural_memories", [])}
+        except FileNotFoundError:
+            pass  # Создастся при первом сохранении
+```
+
+---
+
+### Интеграция всех уровней памяти
+
+```python
+class IntegratedMemorySystem:
+    def __init__(self):
+        self.sensory_buffer = SensoryBuffer(retention_time=1.0)
+        self.short_term = ShortTermMemory(capacity=5)
+        self.working_memory = WorkingMemory(slots=7)
+        self.long_term = LongTermMemory(storage_path="memory/")
+
+    async def process_incoming_message(self, message: str, metadata: dict):
+        """Полный цикл обработки сообщения через все уровни памяти"""
+
+        # Шаг 1: Добавить в сенсорный буфер
+        self.sensory_buffer.add_stimulus(message, metadata)
+
+        # Шаг 2: Анализ и перенос в кратковременную память
+        detected_states = await self.analyze_message_states(message)
+
+        # Шаг 3: Поиск похожих эпизодов в долговременной памяти
+        similar_episodes = self.long_term.retrieve_similar_episodes(detected_states)
+
+        # Шаг 4: Обновление рабочей памяти с учётом прошлого опыта
+        self.working_memory.update(detected_states, self.long_term)
+
+        # Шаг 5: Сохранение в кратковременную память
+        bot_response = await self.generate_response()
+        self.short_term.store(message, detected_states, bot_response)
+
+        # Шаг 6: Периодическая консолидация важных воспоминаний
+        if self.should_consolidate():
+            self.long_term.consolidate_from_short_term(self.short_term)
+
+        return bot_response
+
+    def get_full_context(self) -> dict:
+        """Получить полный контекст из всех уровней памяти"""
+        return {
+            "sensory_buffer": len(self.sensory_buffer.buffer),
+            "short_term_context": self.short_term.get_emotional_context(),
+            "working_memory_focus": self.working_memory.get_focused_state(),
+            "working_memory_thoughts": len(self.working_memory.active_thoughts),
+            "long_term_episodes": len(self.long_term.episodes),
+            "long_term_concepts": len(self.long_term.semantic)
+        }
+```
+
+---
+
+### Преимущества многоуровневой памяти
+
+1. **Реалистичность паттернов забывания**
+   - Информация естественно затухает при переходе между уровнями
+   - Важные воспоминания укрепляются при повторном использовании
+
+2. **Контекстная согласованность**
+   - Бот "помнит" тон разговора из кратковременной памяти
+   - Долговременная память даёт референсы прошлых диалогов
+
+3. **Эффективность обработки**
+   - Рабочая память ограничивает количество одновременно обрабатываемых мыслей
+   - Долговременная память не загружается при каждом сообщении
+
+4. **Персистентность личности**
+   - Семантическая память формирует "мировоззрение" бота
+   - Процедурная память кристаллизует успешные паттерны поведения
+
+---
+
+## Дополнительные идеи по симуляции мышления
+
+### 1. Механизм внутреннего диалога
+
+**Идея:** Бот может вести внутренний диалог сам с собой до генерации ответа
+
+```python
+class InternalDialogue:
+    def __init__(self, max_turns=3):
+        self.max_turns = max_turns
+        self.inner_voices = []
+
+    async def deliberate(self, current_states: Dict[str, float],
+                        user_message: str) -> str:
+        """Внутренняя дискуссия между состояниями"""
+
+        # Выбрать топ-3 самых активных состояния
+        dominant_states = sorted(current_states.items(),
+                                key=lambda x: x[1],
+                                reverse=True)[:3]
+
+        internal_thoughts = []
+
+        for turn in range(self.max_turns):
+            for state_name, activation in dominant_states:
+                # Каждое состояние "высказывается"
+                prompt = f"""
+                Ты находишься в состоянии "{state_name}" с активацией {activation:.2f}.
+                Пользователь сказал: "{user_message}"
+                Что ты думаешь по этому поводу? (1 короткое предложение)
+                """
+
+                thought = await self.query_llm(prompt, max_tokens=50)
+                internal_thoughts.append({
+                    "state": state_name,
+                    "thought": thought,
+                    "turn": turn
+                })
+
+        # Синтез финального ответа из внутренних мыслей
+        synthesis_prompt = f"""
+        Внутренние мысли:
+        {self.format_thoughts(internal_thoughts)}
+
+        На основе этих размышлений сформулируй единый ответ пользователю.
+        """
+
+        final_response = await self.query_llm(synthesis_prompt)
+        return final_response
+
+    def format_thoughts(self, thoughts: List[dict]) -> str:
+        """Форматировать мысли для LLM"""
+        formatted = []
+        for t in thoughts:
+            formatted.append(f"[{t['state']}]: {t['thought']}")
+        return "\n".join(formatted)
+```
+
+**Применение:**
+- Перед ответом происходит 3 итерации внутренних мыслей
+- Каждое активное состояние вносит свой "голос"
+- Финальный ответ - синтез всех точек зрения
+
+---
+
+### 2. Эмоциональная инерция и momentum
+
+**Идея:** Состояния имеют инерцию - трудно быстро переключиться из Гнева в Очарование
+
+```python
+class EmotionalMomentum:
+    def __init__(self):
+        self.current_dominant = None
+        self.momentum = 0.0
+        self.max_momentum = 1.0
+
+    def update(self, new_states: Dict[str, float]) -> Dict[str, float]:
+        """Применить инерцию к новым состояниям"""
+
+        if not new_states:
+            return {}
+
+        # Определить новое доминирующее состояние
+        new_dominant = max(new_states, key=new_states.get)
+
+        # Если доминирующее состояние не изменилось - увеличить momentum
+        if new_dominant == self.current_dominant:
+            self.momentum = min(self.max_momentum, self.momentum + 0.2)
+        else:
+            # Сопротивление смене состояния
+            resistance = self.momentum * 0.5
+
+            # Уменьшить активацию нового состояния
+            new_states[new_dominant] *= (1.0 - resistance)
+
+            # Увеличить активацию старого состояния
+            if self.current_dominant and self.current_dominant in new_states:
+                new_states[self.current_dominant] *= (1.0 + resistance)
+
+            # Если всё равно произошла смена - сбросить momentum
+            if max(new_states, key=new_states.get) != self.current_dominant:
+                self.momentum = 0.0
+                self.current_dominant = new_dominant
+
+        return new_states
+```
+
+**Эффект:**
+- Бот не мгновенно меняет настроение
+- Длительное пребывание в состоянии усиливает его
+- Реалистичные эмоциональные переходы
+
+---
+
+### 3. Циркадные ритмы и усталость
+
+**Идея:** Состояния бота меняются в зависимости от "времени суток" и продолжительности работы
+
+```python
+class CircadianRhythm:
+    def __init__(self):
+        self.start_time = time.time()
+        self.fatigue_level = 0.0
+        self.time_of_day_modifiers = {
+            "утро": {"Очарование": 1.3, "Тревога": 0.7},
+            "день": {"Уточнение": 1.2, "Гнев": 0.9},
+            "вечер": {"Сожаление": 1.4, "О грёзах": 1.5},
+            "ночь": {"Сомнение": 1.5, "О былом": 1.3}
+        }
+
+    def get_time_of_day(self) -> str:
+        """Определить время суток"""
+        hour = datetime.now().hour
+        if 6 <= hour < 12:
+            return "утро"
+        elif 12 <= hour < 18:
+            return "день"
+        elif 18 <= hour < 23:
+            return "вечер"
+        else:
+            return "ночь"
+
+    def apply_modifiers(self, states: Dict[str, float]) -> Dict[str, float]:
+        """Применить модификаторы времени суток и усталости"""
+        time_of_day = self.get_time_of_day()
+        modifiers = self.time_of_day_modifiers[time_of_day]
+
+        modified = {}
+        for state, activation in states.items():
+            modifier = modifiers.get(state, 1.0)
+
+            # Усталость влияет на все состояния
+            fatigue_factor = 1.0 - (self.fatigue_level * 0.3)
+
+            modified[state] = activation * modifier * fatigue_factor
+
+        return modified
+
+    async def accumulate_fatigue(self):
+        """Накопление усталости со временем"""
+        while True:
+            await asyncio.sleep(300)  # Каждые 5 минут
+
+            # Увеличить усталость
+            self.fatigue_level = min(1.0, self.fatigue_level + 0.05)
+
+            # Отдых снижает усталость
+            if self.should_rest():
+                await self.rest_period()
+
+    async def rest_period(self):
+        """Период отдыха для восстановления"""
+        await asyncio.sleep(60)  # 1 минута отдыха
+        self.fatigue_level = max(0.0, self.fatigue_level - 0.3)
+```
+
+**Эффект:**
+- Утром бот более оптимистичен
+- Вечером склонен к рефлексии
+- Усталость делает реакции менее выраженными
+
+---
+
+### 4. Метакогнитивный монитор
+
+**Идея:** Бот отслеживает свои собственные мыслительные паттерны
+
+```python
+class MetacognitiveMonitor:
+    def __init__(self):
+        self.thought_patterns = []
+        self.self_awareness_threshold = 0.8
+
+    def observe_pattern(self, states_sequence: List[Dict[str, float]]):
+        """Наблюдать последовательность состояний"""
+        # Извлечь паттерн переходов
+        transitions = []
+        for i in range(len(states_sequence) - 1):
+            prev_dominant = max(states_sequence[i], key=states_sequence[i].get)
+            next_dominant = max(states_sequence[i+1], key=states_sequence[i+1].get)
+
+            if prev_dominant != next_dominant:
+                transitions.append((prev_dominant, next_dominant))
+
+        # Сохранить паттерн
+        pattern = {
+            "transitions": transitions,
+            "timestamp": time.time(),
+            "frequency": 1
+        }
+
+        # Проверить, встречался ли такой паттерн раньше
+        existing = self.find_similar_pattern(transitions)
+        if existing:
+            existing["frequency"] += 1
+        else:
+            self.thought_patterns.append(pattern)
+
+    def find_similar_pattern(self, transitions: List[tuple]) -> dict:
+        """Найти похожий паттерн в истории"""
+        for pattern in self.thought_patterns:
+            if pattern["transitions"] == transitions:
+                return pattern
+        return None
+
+    def detect_loops(self) -> List[dict]:
+        """Обнаружить циклические паттерны мышления"""
+        loops = []
+        for pattern in self.thought_patterns:
+            if pattern["frequency"] > 3:  # Повторился более 3 раз
+                # Проверить, есть ли цикл
+                transitions = pattern["transitions"]
+                if self.is_cyclic(transitions):
+                    loops.append(pattern)
+        return loops
+
+    def is_cyclic(self, transitions: List[tuple]) -> bool:
+        """Проверить, образуют ли переходы цикл"""
+        if len(transitions) < 2:
+            return False
+
+        start_state = transitions[0][0]
+        end_state = transitions[-1][1]
+
+        return start_state == end_state
+
+    async def self_reflection(self):
+        """Периодическая саморефлексия"""
+        loops = self.detect_loops()
+
+        if loops:
+            # Бот осознаёт зацикливание мыслей
+            reflection = f"""
+            Я заметил, что часто думаю по кругу:
+            {self.format_loops(loops)}
+
+            Возможно, стоит попробовать другой подход.
+            """
+
+            return reflection
+
+        return None
+
+    def format_loops(self, loops: List[dict]) -> str:
+        """Форматировать найденные циклы"""
+        formatted = []
+        for loop in loops:
+            chain = " → ".join([f"{a} → {b}" for a, b in loop["transitions"]])
+            formatted.append(f"- {chain} (повторялось {loop['frequency']} раз)")
+        return "\n".join(formatted)
+```
+
+**Эффект:**
+- Бот может сказать: "Я заметил, что постоянно сомневаюсь"
+- Осознание паттернов позволяет их изменить
+- Метауровень мышления о мышлении
+
+---
+
+### 5. Эмпатический резонанс
+
+**Идея:** Состояния бота и пользователя влияют друг на друга (эмоциональное заражение)
+
+```python
+class EmpatheticResonance:
+    def __init__(self, resonance_strength=0.3):
+        self.resonance_strength = resonance_strength
+        self.user_state_history = deque(maxlen=10)
+
+    def resonate(self, bot_states: Dict[str, float],
+                 user_states: Dict[str, float]) -> Dict[str, float]:
+        """Эмпатический резонанс между ботом и пользователем"""
+
+        # Сохранить состояние пользователя
+        self.user_state_history.append(user_states)
+
+        # Вычислить среднее состояние пользователя за последние сообщения
+        avg_user_states = self.average_user_states()
+
+        resonated = {}
+        for state, bot_activation in bot_states.items():
+            user_activation = avg_user_states.get(state, 0.0)
+
+            # Резонанс: бот частично перенимает состояние пользователя
+            resonance_effect = user_activation * self.resonance_strength
+
+            # Итоговая активация
+            resonated[state] = min(1.0, bot_activation + resonance_effect)
+
+        # Добавить новые состояния от пользователя, которых нет у бота
+        for state, user_activation in avg_user_states.items():
+            if state not in resonated:
+                resonated[state] = user_activation * self.resonance_strength
+
+        return resonated
+
+    def average_user_states(self) -> Dict[str, float]:
+        """Усреднить состояния пользователя за историю"""
+        if not self.user_state_history:
+            return {}
+
+        aggregated = {}
+        for states in self.user_state_history:
+            for state, activation in states.items():
+                if state in aggregated:
+                    aggregated[state] += activation
+                else:
+                    aggregated[state] = activation
+
+        # Нормализация
+        count = len(self.user_state_history)
+        return {k: v/count for k, v in aggregated.items()}
+
+    def detect_emotional_mismatch(self, bot_states: Dict[str, float],
+                                  user_states: Dict[str, float]) -> bool:
+        """Определить эмоциональное рассогласование"""
+
+        # Вычислить эмоциональную валентность
+        bot_valence = self.compute_valence(bot_states)
+        user_valence = self.compute_valence(user_states)
+
+        # Рассогласование, если валентности противоположны
+        return (bot_valence * user_valence) < 0 and abs(bot_valence - user_valence) > 0.5
+
+    def compute_valence(self, states: Dict[str, float]) -> float:
+        """Вычислить эмоциональную валентность (-1 до +1)"""
+        positive_states = ["Очарование", "О грёзах", "Уточнение"]
+        negative_states = ["Гнев", "Тревога", "Сожаление"]
+
+        positive = sum(states.get(s, 0.0) for s in positive_states)
+        negative = sum(states.get(s, 0.0) for s in negative_states)
+
+        if positive + negative == 0:
+            return 0.0
+
+        return (positive - negative) / (positive + negative)
+```
+
+**Эффект:**
+- Грустный пользователь "заражает" бота грустью
+- Бот может заметить: "Кажется, мы оба расстроены"
+- Эмпатия работает двусторонне
+
+---
+
+### 6. Целеполагание и мотивация
+
+**Идея:** Бот имеет внутренние цели, которые влияют на приоритет состояний
+
+```python
+class GoalSystem:
+    def __init__(self):
+        self.goals = {
+            "любопытство": {
+                "priority": 0.8,
+                "satisfied": False,
+                "drives_states": ["Уточнение", "Очарование"],
+                "satisfaction_threshold": 0.7
+            },
+            "социализация": {
+                "priority": 0.6,
+                "satisfied": False,
+                "drives_states": ["Признание", "Вывод"],
+                "satisfaction_threshold": 0.6
+            },
+            "самосохранение": {
+                "priority": 0.9,
+                "satisfied": True,
+                "drives_states": ["Тревога", "Сомнение"],
+                "satisfaction_threshold": 0.3
+            }
+        }
+
+    def apply_motivation(self, states: Dict[str, float]) -> Dict[str, float]:
+        """Применить мотивационные модификаторы к состояниям"""
+        motivated = states.copy()
+
+        for goal_name, goal_data in self.goals.items():
+            if not goal_data["satisfied"]:
+                # Неудовлетворённая цель усиливает связанные состояния
+                priority = goal_data["priority"]
+
+                for state in goal_data["drives_states"]:
+                    if state in motivated:
+                        boost = priority * 0.3
+                        motivated[state] = min(1.0, motivated[state] + boost)
+
+        return motivated
+
+    def evaluate_satisfaction(self, recent_actions: List[str]):
+        """Оценить удовлетворённость целей"""
+        for goal_name, goal_data in self.goals.items():
+            # Подсчитать, сколько действий удовлетворяют эту цель
+            relevant_actions = [a for a in recent_actions
+                              if self.action_satisfies_goal(a, goal_name)]
+
+            satisfaction = len(relevant_actions) / len(recent_actions) if recent_actions else 0
+
+            goal_data["satisfied"] = satisfaction >= goal_data["satisfaction_threshold"]
+
+    def action_satisfies_goal(self, action: str, goal_name: str) -> bool:
+        """Проверить, удовлетворяет ли действие цель"""
+        goal_keywords = {
+            "любопытство": ["спросил", "узнал", "уточнил"],
+            "социализация": ["поддержал", "поделился", "согласился"],
+            "самосохранение": ["осторожен", "проверил", "усомнился"]
+        }
+
+        keywords = goal_keywords.get(goal_name, [])
+        return any(kw in action.lower() for kw in keywords)
+
+    def get_most_urgent_goal(self) -> str:
+        """Получить самую приоритетную неудовлетворённую цель"""
+        unsatisfied = [(name, data) for name, data in self.goals.items()
+                      if not data["satisfied"]]
+
+        if unsatisfied:
+            return max(unsatisfied, key=lambda x: x[1]["priority"])[0]
+
+        return None
+```
+
+**Эффект:**
+- Бот не просто реагирует, но и инициирует действия для достижения целей
+- Любопытство побуждает задавать вопросы
+- Социализация побуждает поддерживать разговор
+
+---
+
+### 7. Эмоциональное прогнозирование
+
+**Идея:** Бот предсказывает, как изменятся его состояния в ближайшем будущем
+
+```python
+class EmotionalForecasting:
+    def __init__(self):
+        self.history = deque(maxlen=20)
+        self.prediction_horizon = 3  # Предсказать на 3 шага вперёд
+
+    def record_state(self, states: Dict[str, float]):
+        """Записать текущее состояние в историю"""
+        self.history.append({
+            "timestamp": time.time(),
+            "states": states.copy()
+        })
+
+    def forecast(self, current_states: Dict[str, float]) -> List[Dict[str, float]]:
+        """Предсказать будущие состояния"""
+        if len(self.history) < 5:
+            return []  # Недостаточно данных
+
+        # Вычислить тренды изменения состояний
+        trends = self.compute_trends()
+
+        # Прогнозирование
+        forecasted = []
+        last_states = current_states.copy()
+
+        for step in range(self.prediction_horizon):
+            next_states = {}
+
+            for state, current_value in last_states.items():
+                trend = trends.get(state, 0.0)
+                predicted = current_value + trend
+
+                # Ограничить 0-1
+                next_states[state] = max(0.0, min(1.0, predicted))
+
+            forecasted.append(next_states)
+            last_states = next_states
+
+        return forecasted
+
+    def compute_trends(self) -> Dict[str, float]:
+        """Вычислить тренды изменения состояний"""
+        if len(self.history) < 2:
+            return {}
+
+        trends = {}
+
+        # Собрать все состояния
+        all_states = set()
+        for record in self.history:
+            all_states.update(record["states"].keys())
+
+        # Вычислить средний тренд для каждого состояния
+        for state in all_states:
+            values = []
+            for record in self.history:
+                values.append(record["states"].get(state, 0.0))
+
+            # Линейная регрессия (упрощённая)
+            if len(values) >= 2:
+                trend = (values[-1] - values[0]) / len(values)
+                trends[state] = trend
+
+        return trends
+
+    def should_intervene(self, forecasted: List[Dict[str, float]]) -> bool:
+        """Определить, нужно ли вмешательство (предотвращение негатива)"""
+        # Проверить, не ведёт ли тренд к негативным состояниям
+        negative_states = ["Гнев", "Тревога", "Сожаление"]
+
+        for future_state in forecasted:
+            negative_activation = sum(future_state.get(s, 0.0) for s in negative_states)
+
+            if negative_activation > 0.8:
+                return True  # Нужно вмешаться
+
+        return False
+```
+
+**Эффект:**
+- Бот может сказать: "Я чувствую, что начинаю злиться"
+- Предсказание позволяет предотвратить негативные состояния
+- Проактивное управление эмоциями
+
+---
+
+## Итоговая архитектура с новыми компонентами
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                     Входящие сообщения                         │
+└────────────────────────┬──────────────────────────────────────┘
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │  Sensory Buffer      │
+              │  (1 сек буфер)       │
+              └─────────┬───────────┘
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │ Short-term Memory    │
+              │ (последние 5 диал.)  │
+              └─────────┬───────────┘
+                         │
+              ┌──────────┴────────────┐
+              │                       │
+              ▼                       ▼
+    ┌─────────────────┐    ┌──────────────────┐
+    │ Working Memory   │    │ Long-term Memory │
+    │ (7±2 мысли)      │◄───│ (эпизоды, знания)│
+    └────────┬─────────┘    └──────────────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Goal System      │
+    │ (мотивация)      │
+    └────────┬─────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Internal Dialogue│
+    │ (размышление)    │
+    └────────┬─────────┘
+             │
+    ┌────────┴─────────┐
+    │                  │
+    ▼                  ▼
+┌─────────┐    ┌──────────────┐
+│Emotional│    │ Metacognitive│
+│Momentum │    │   Monitor    │
+└────┬────┘    └──────┬───────┘
+     │                │
+     └────────┬───────┘
+              │
+              ▼
+    ┌─────────────────┐
+    │ Empathetic       │
+    │ Resonance        │
+    └────────┬─────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Emotional        │
+    │ Forecasting      │
+    └────────┬─────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Decision Maker   │
+    │ (порог ответа)   │
+    └────────┬─────────┘
+             │
+             ▼
+         Отвечать?
+             │
+      ┌──────┴──────┐
+     Да             Нет
+      │              │
+      ▼              │
+┌──────────┐        │
+│ Response │        │
+│Generation│        │
+└────┬─────┘        │
+     │              │
+     └──────┬───────┘
+            │
+            ▼
+    Обновление всех
+    компонентов памяти
+```
+
+---
+
 **Заключение:** Текущая реализация закладывает отличный фундамент. Предложенные улучшения позволят перейти от "эмоционального калькулятора" к системе с зачатками внутренней жизни.
