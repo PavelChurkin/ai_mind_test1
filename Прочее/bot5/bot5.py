@@ -541,7 +541,7 @@ def store_vk_message(peer_id, msg):
     text, images = render_for_history(msg)
     rowid = db_add_message(
         peer_id, from_id, from_id == BOT_GROUP_ID, text,
-        msg.get("date") or int(time.time()),
+        msg.get("date") or int(now()),
         cmid=msg.get("conversation_message_id"), vk_msg_id=msg.get("id"), images=images,
     )
     return rowid, text, images
@@ -590,7 +590,7 @@ def vk_send(peer_id, text, reply_to_msg=None):
         except Exception as e:
             log.error("vk_send: %s", e)
             continue
-        db_add_message(peer_id, BOT_GROUP_ID, True, part, int(time.time()),
+        db_add_message(peer_id, BOT_GROUP_ID, True, part, int(now()),
                        cmid=sent_cmid, vk_msg_id=sent_id)
 
 
@@ -827,7 +827,7 @@ class Request:
         self.message = message
         self.peer_id = message["peer_id"]
         self.from_id = message.get("from_id", 0)
-        self.ts = message.get("date") or int(time.time())
+        self.ts = message.get("date") or int(now())
         self.rowid = rowid
         self.text = text
         self.images = list(images)
