@@ -63,7 +63,8 @@ PAUSE_MAX_MINUTES = 60
 FRESHNESS_MINUTES = 10             # если обращение старше — не отвечаем
 
 # --- дневной лимит ---
-DAILY_MESSAGE_LIMIT = 100          # ответов бота в сутки на беседу (0 — без лимита)
+DAILY_MESSAGE_LIMIT = 100          # ответов бота в сутки (0 — без лимита)
+DAILY_LIMIT_PER_CHAT = True        # True — свой лимит у каждой беседы, False — один на все беседы
 LIMIT_NOTIFY_PERCENTS = (25, 50, 90, 100)
 LIMIT_RESET_HOUR = 0               # в этот час (по времени сервера) начинаются новые сутки
 
@@ -724,8 +725,12 @@ def next_reset_dt():
     return datetime(d.year, d.month, d.day) + timedelta(days=1, hours=LIMIT_RESET_HOUR)
 
 
+def daily_key(peer_id):
+    return f"daily_{peer_id}" if DAILY_LIMIT_PER_CHAT else "daily_all"
+
+
 def daily_state(peer_id):
-    raw = db_state_get(f"daily_{peer_id}")
+    raw = db_state_get(daily_key(peer_id))
     st = json.loads(raw) if raw else {}
     if st.get("day") != day_key():
         st = {"day": day_key(), "count": 0, "notified": []}   # новые сутки — лимит сброшен
@@ -745,7 +750,7 @@ def count_answer(peer_id):
     crossed = [p for p in LIMIT_NOTIFY_PERCENTS
                if p not in st["notified"] and st["count"] >= math.ceil(DAILY_MESSAGE_LIMIT * p / 100)]
     st["notified"].extend(crossed)
-    db_state_set(f"daily_{peer_id}", json.dumps(st))
+    db_state_set(daily_key(peer_id), json.dumps(st))
     if not crossed:
         return
     p = max(crossed)  # при маленьком лимите пороги могут совпасть — сообщаем о старшем
@@ -1298,7 +1303,7 @@ def run_command(req):
         cmd_limit(req, arg, "chars", "Лимит символов истории", MAX_CONTEXT_CHARS,
                   MAX_CONTEXT_CHARS_CAP, chars_limit)
     elif name == "сбросить лимит":
-        db_state_del(f"daily_{peer_id}")
+        db_state_del(daily_key(peer_id))
         send_system(peer_id, f"Дневной лимит сообщений сброшен: 0 из {DAILY_MESSAGE_LIMIT}.",
                     reply_to_msg=message)
 

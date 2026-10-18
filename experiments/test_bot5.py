@@ -407,6 +407,18 @@ class TestDailyLimit(Bot5Case):
                 hits[i] = self.sent()[-1]
         self.assertEqual(sorted(hits), [25, 50, 90, 100])
 
+    def test_per_chat_and_global_scope(self):
+        for _ in range(4):
+            self.ask()
+        self.assertFalse(bot5.daily_limit_reached(CHAT + 1))   # у другой беседы — свой лимит
+        bot5.DAILY_LIMIT_PER_CHAT = False
+        try:
+            for _ in range(4):
+                bot5.count_answer(CHAT + 1)
+            self.assertTrue(bot5.daily_limit_reached(CHAT + 2))  # общий лимит на все беседы
+        finally:
+            bot5.DAILY_LIMIT_PER_CHAT = True
+
     def test_reset_next_day(self):
         for _ in range(4):
             self.ask()
