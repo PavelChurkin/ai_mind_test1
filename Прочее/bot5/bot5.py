@@ -1267,9 +1267,9 @@ def run_command(req):
     name, arg = req.command
 
     if needs_admin(req.command) and not is_admin(peer_id, req.from_id):
-        what = (f"Пересказ больше {SUMMARY_FREE_MAX} сообщений" if name == "пересказ"
-                else "Эта команда")
-        send_system(peer_id, f"{what} доступна только админу беседы.", reply_to_msg=message)
+        what = (f"Пересказ больше {SUMMARY_FREE_MAX} сообщений доступен" if name == "пересказ"
+                else "Эта команда доступна")
+        send_system(peer_id, f"{what} только админу беседы.", reply_to_msg=message)
         return
 
     if name in LLM_COMMANDS:
