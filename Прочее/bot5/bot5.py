@@ -1,43 +1,84 @@
-# bot4.py — бот «Грань» для чата сообщества ВКонтакте (следующая версия bot3.py)
+# bot5.py — бот «Грань» для чата сообщества ВКонтакте (следующая версия bot4.py)
 #
-# Что изменилось по сравнению с bot3 (подробно — в README.md этой папки):
-#   * контекст больше не пустеет: сообщения в беседах хранятся по
-#     (peer_id, conversation_message_id), а не по id, который у бота в беседе = 0;
-#   * свои ответы бот сохраняет в историю сразу после отправки;
-#   * контекст — последние N сообщений, а не «только за 30 минут»;
-#   * бот отвечает на reply к своим сообщениям (без слова «грань»);
-#   * в историю попадает текст пересланных сообщений (с вложенностью);
-#   * бот видит картинки (vision-модель) и текст постов, которыми поделились.
+# Что добавлено по сравнению с bot4 (подробно — в README.md этой папки):
+#   * личные сообщения — только если разрешено (ALLOW_PRIVATE_MESSAGES, по умолчанию нет);
+#     в личке собеседнику доступны все команды админа;
+#   * /помощь — список команд с описаниями и правами;
+#   * /пауза — бот копит обращения и отвечает на них после паузы;
+#   * /лимит токенов, /лимит символов — настройки беседы (только админ);
+#   * пакетные ответы: бот ждёт BATCH_WAIT_SEC тишины и отвечает на все обращения разом;
+#   * контекст растёт в активном споре и возвращается к CONTEXT_SIZE после тишины;
+#     если история не влезает в лимит символов, старая часть сжимается в пересказ;
+#   * дневной лимит сообщений с оповещениями 25/50/90/100 % и /сбросить лимит сообщений;
+#   * /пересказ N от ЧЧ:ММ ДД.ММ.ГГГГ — пересказ с даты, с догрузкой истории из ВК;
+#   * /мысль, /мысль подробно — философские размышления (модуль filosof.py из ai_filosof);
+#   * пост в контекст попадает целиком (POST_MAX_CHARS убран).
 import os
 import re
 import sys
 import json
+import math
 import time
 import base64
 import signal
 import sqlite3
 import logging
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if BOT_DIR not in sys.path:
+    sys.path.insert(0, BOT_DIR)
+import filosof  # noqa: E402  (лежит рядом с ботом)
 
 # ============ НАСТРОЙКИ ============
 BOT_NAME = "Грань разумного"
 TRIGGER_RE = re.compile(r"\bгрань\b", re.IGNORECASE)
 STOP_PHRASE = "грань, стоп машина"
 
-CONTEXT_SIZE = 40                  # максимум последних сообщений в контексте
+# --- личные сообщения и права ---
+ALLOW_PRIVATE_MESSAGES = False     # можно ли боту отвечать в личных сообщениях (по умолчанию — нет)
+ADMIN_CACHE_MINUTES = 10           # сколько минут помнить список админов беседы
+# ADMIN_IDS в .env — id пользователей, которые админы бота в любой беседе (через запятую)
+
+# --- контекст ---
+CONTEXT_SIZE = 30                  # обычный размер контекста (последних сообщений)
+CONTEXT_SIZE_MAX = 300             # потолок роста контекста в активном споре
+CONTEXT_RESET_MINUTES = 5          # столько минут без новых сообщений — контекст снова CONTEXT_SIZE
 CONTEXT_MIN_MESSAGES = 10          # столько последних сообщений берём всегда, даже если они старые
-CONTEXT_MEMORY_HOURS = 12          # более старые сообщения — только в пределах CONTEXT_MIN_MESSAGES
-MAX_CONTEXT_CHARS = 12000          # ограничение длины истории в промпте (обрезаем самые старые)
+CONTEXT_MEMORY_HOURS = 12          # более старые сообщения — только в пределах CONTEXT_MIN_MESSAGES (0 — без ограничения)
+MAX_CONTEXT_CHARS = 12000          # стандартный лимит символов истории в запросе (меняется /лимит символов)
+MAX_CONTEXT_CHARS_CAP = 300000     # больше этого /лимит символов не поставит
+CONTEXT_SUMMARY_CHARS = 2000       # размер сжатого пересказа старой части истории
+CONTEXT_KEEP_SHARE = 0.6           # после сжатия свежая часть занимает не больше этой доли остатка
+
+# --- ответы ---
+MAX_TOKENS_DEFAULT = 800           # стандартный лимит выходных токенов (меняется /лимит токенов)
+MAX_TOKENS_CAP = 64000             # больше этого /лимит токенов не поставит
+TOKEN_LIMIT_RESET_MINUTES = 60     # через столько минут /лимит токенов сам вернётся к стандарту (0 — не вернётся)
+BATCH_WAIT_SEC = 8                 # ждём столько секунд без новых обращений и отвечаем на все разом
+BATCH_MAX_WAIT_SEC = 60            # но не дольше этого с первого обращения
+PAUSE_DEFAULT_MINUTES = 1          # /пауза без числа
+PAUSE_MAX_MINUTES = 60
+FRESHNESS_MINUTES = 10             # если обращение старше — не отвечаем
+
+# --- дневной лимит ---
+DAILY_MESSAGE_LIMIT = 100          # ответов бота в сутки на беседу (0 — без лимита)
+LIMIT_NOTIFY_PERCENTS = (25, 50, 90, 100)
+LIMIT_RESET_HOUR = 0               # в этот час (по времени сервера) начинаются новые сутки
+
+# --- пересказ ---
+SUMMARY_MAX_INPUT = 5000           # больше сообщений не пересказываем
+SUMMARY_FREE_MAX = 100             # пересказ больше стольких сообщений — только админ
+SUMMARY_DEFAULT_COUNT = 100        # /пересказ без числа
+SUMMARY_MAX_TOKENS = 1500
+HISTORY_LOAD_MAX = 20000           # сколько сообщений максимум догружать из ВК для пересказа с даты
+
+# --- история и вложения ---
 INITIAL_LOAD = 1000                # сколько сообщений загрузить при первом старте
 SYNC_ON_START = 200                # при каждом следующем старте — догрузить пропущенное
-FRESHNESS_MINUTES = 10             # если обращение старше — не отвечаем
-SUMMARY_MAX_INPUT = 5000
-RESPOND_IN_PRIVATE = True          # в личных сообщениях отвечать без слова «грань»
-
 FWD_MAX_DEPTH = 4                  # глубина вложенности пересланных сообщений
-POST_MAX_CHARS = 4000              # сколько символов поста брать в контекст
-QUOTE_MAX_CHARS = 200              # цитата сообщения, на которое ответили (в истории)
+QUOTE_MAX_CHARS = 300              # цитата сообщения, на которое ответили reply (0 — целиком)
 
 MAX_IMAGES_PER_REQUEST = 4         # картинок в одном запросе к LLM
 IMAGE_MODE = "base64"              # "base64" — скачать и передать данными, "url" — передать ссылку
@@ -46,15 +87,17 @@ IMAGE_MAX_SIDE = 1280              # предпочитаем размер фо�
 
 LLM_MIN_INTERVAL_SEC = 3           # не чаще одного запроса к LLM за столько секунд
 VK_MESSAGE_LIMIT = 4000            # ВК режет сообщения длиннее 4096 символов
+LONGPOLL_WAIT_SEC = 1              # Long Poll возвращается не реже — чтобы вовремя отвечать пакетам
 
-DB_PATH = "gran4.db"
-OLD_DB_PATH = "gran.db"            # БД bot3: из неё переносятся роли и имена
+DB_PATH = "gran5.db"
+OLD_DB_PATH = "gran4.db"           # БД bot4: из неё переносятся сообщения, роли и имена
 
 PROXYAPI_BASE_URL = "https://api.proxyapi.ru/v1"
 MODEL_NAME = "deepseek/deepseek-v4-flash-vision-exp"
 # ===================================
 
 CHAT_PEER_OFFSET = 2000000000      # peer_id бесед начинается с 2e9
+SYSTEM_MARK = "⚙️"                 # служебные сообщения бота; в контекст LLM не попадают
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gran")
@@ -63,6 +106,7 @@ DEFAULT_ROLE = (
     "Ты — Грань, участник беседы. Общайся живо, по-человечески, "
     "не будь слишком формальной, подстраивайся под тон беседы."
 )
+LIMIT_REACHED_TEXT = "Извините, сегодня лимит сообщений достигнут."
 
 STOP_REQUESTED = False
 
@@ -72,7 +116,16 @@ vk = None
 llm_client = None
 BOT_GROUP_ID = 0                   # отрицательный id сообщества (from_id сообщений бота)
 VK_USER_TOKEN = None               # необязательный ключ пользователя/сервисный — для wall.getById
+ADMIN_IDS = set()
 _last_llm_call = 0.0
+_admin_cache = {}                  # peer_id -> (когда загружен, {id админов})
+PEERS = {}                         # peer_id -> PeerState: очередь обращений, пауза, размер контекста
+FILOSOF = filosof.ThoughtGenerator()
+
+
+def now():
+    """Текущее время; тесты подменяют эту функцию."""
+    return time.time()
 
 
 # ============ БД ============
@@ -144,18 +197,24 @@ def db_add_message(peer_id, from_id, is_bot, text, ts, cmid=None, vk_msg_id=None
         return None
 
 
-def db_get_context(peer_id, limit, since_ts=None, min_rows=0, exclude_id=None, after_ts=None):
+def _rows(rows):
+    """Строки контекста: (id, from_id, is_bot, text, ts, images[])."""
+    return [(r[0], r[1], r[2], r[3], r[4], json.loads(r[5]) if r[5] else []) for r in rows]
+
+
+def db_get_context(peer_id, limit, since_ts=None, min_rows=0, exclude_ids=(), after_ts=None):
     """
     Последние `limit` сообщений беседы в порядке старые → новые.
     since_ts  — мягкая граница: старше неё берём не больше `min_rows` последних сообщений;
     after_ts  — жёсткая граница (команда /забудь): старше неё не берём ничего;
-    exclude_id — не включать это сообщение (то, на которое сейчас отвечаем).
-    Строки: (from_id, is_bot, text, ts, images[]).
+    exclude_ids — не включать эти сообщения (те, на которые сейчас отвечаем).
     """
+    exclude_ids = list(exclude_ids) or [-1]
+    marks = ",".join("?" * len(exclude_ids))
     rows = DB.execute(
-        "SELECT id,from_id,is_bot,text,ts,images FROM messages "
-        "WHERE peer_id=? AND id!=? AND ts>=? ORDER BY ts DESC, id DESC LIMIT ?",
-        (peer_id, exclude_id or -1, after_ts or 0, limit),
+        f"SELECT id,from_id,is_bot,text,ts,images FROM messages "
+        f"WHERE peer_id=? AND id NOT IN ({marks}) AND ts>=? ORDER BY ts DESC, id DESC LIMIT ?",
+        (peer_id, *exclude_ids, after_ts or 0, limit),
     ).fetchall()
     rows.reverse()
     if since_ts is not None:
@@ -163,7 +222,19 @@ def db_get_context(peer_id, limit, since_ts=None, min_rows=0, exclude_id=None, a
         if len(recent) < min_rows:
             recent = rows[-min_rows:] if min_rows else []
         rows = recent
-    return [(r[1], r[2], r[3], r[4], json.loads(r[5]) if r[5] else []) for r in rows]
+    return _rows(rows)
+
+
+def db_get_range(peer_id, start_ts, limit, exclude_ids=()):
+    """Первые `limit` сообщений беседы, начиная с start_ts (старые → новые)."""
+    exclude_ids = list(exclude_ids) or [-1]
+    marks = ",".join("?" * len(exclude_ids))
+    rows = DB.execute(
+        f"SELECT id,from_id,is_bot,text,ts,images FROM messages "
+        f"WHERE peer_id=? AND id NOT IN ({marks}) AND ts>=? ORDER BY ts ASC, id ASC LIMIT ?",
+        (peer_id, *exclude_ids, start_ts, limit),
+    ).fetchall()
+    return _rows(rows)
 
 
 def db_get_role(peer_id):
@@ -194,6 +265,11 @@ def db_state_set(key, value):
     DB.commit()
 
 
+def db_state_del(key):
+    DB.execute("DELETE FROM state WHERE key=?", (key,))
+    DB.commit()
+
+
 def db_get_user_name(user_id):
     r = DB.execute("SELECT first_name, last_name FROM users WHERE user_id=?", (user_id,)).fetchone()
     if not r:
@@ -211,23 +287,33 @@ def db_upsert_user(user_id, first_name, last_name=""):
     DB.commit()
 
 
-def migrate_from_bot3(old_path=OLD_DB_PATH):
-    """Переносит роли и имена из БД bot3. Сообщения не переносим: в старой БД
-    они неполные (см. баг с id=0) — история заново загружается из ВК."""
-    if db_state_get("migrated_bot3") == "1" or not os.path.exists(old_path):
+def migrate_from_bot4(old_path=OLD_DB_PATH):
+    """Переносит из БД bot4 сообщения, роли, имена и метки /забудь: схема та же,
+    история в bot4 уже полная, загружать её из ВК заново не нужно."""
+    if db_state_get("migrated_bot4") == "1" or not os.path.exists(old_path):
         return
     try:
         old = sqlite3.connect(old_path)
+        n = 0
+        for row in old.execute(
+                "SELECT peer_id,cmid,vk_msg_id,from_id,is_bot,text,images,ts FROM messages ORDER BY id"):
+            n += DB.execute(
+                "INSERT OR IGNORE INTO messages(peer_id,cmid,vk_msg_id,from_id,is_bot,text,images,ts) "
+                "VALUES(?,?,?,?,?,?,?,?)", row).rowcount
         for peer_id, role in old.execute("SELECT peer_id, role FROM roles"):
             DB.execute("INSERT OR IGNORE INTO roles(peer_id, role) VALUES(?,?)", (peer_id, role))
         for row in old.execute("SELECT user_id, first_name, last_name, updated_at FROM users"):
             DB.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)", row)
+        for key, value in old.execute("SELECT key, value FROM state WHERE key LIKE 'forget_%'"):
+            DB.execute("INSERT OR IGNORE INTO state(key, value) VALUES(?,?)", (key, value))
         old.close()
         DB.commit()
-        db_state_set("migrated_bot3", "1")
-        log.info("Роли и имена перенесены из %s", old_path)
+        if n:
+            db_state_set("initial_load_done", "1")
+        db_state_set("migrated_bot4", "1")
+        log.info("Из %s перенесено %d сообщений, роли и имена", old_path, n)
     except Exception as e:
-        log.warning("migrate_from_bot3: %s", e)
+        log.warning("migrate_from_bot4: %s", e)
 
 
 # ============ Имена ============
@@ -253,13 +339,13 @@ def vk_fetch_names(ids):
 
 def ensure_names(ids):
     """Дозагрузка имён, которых нет в БД или которые устарели (>24ч)."""
-    now = int(time.time())
+    t = int(time.time())
     missing = []
     for i in set(ids):
         if not i or i == BOT_GROUP_ID:
             continue
         r = DB.execute("SELECT updated_at FROM users WHERE user_id=?", (i,)).fetchone()
-        if not r or now - r[0] >= 86400:
+        if not r or t - r[0] >= 86400:
             missing.append(i)
     if missing:
         vk_fetch_names(missing)
@@ -294,6 +380,36 @@ def collect_author_ids(obj, acc=None, depth=0):
     return acc
 
 
+# ============ Права ============
+def is_private(peer_id):
+    return 0 < peer_id < CHAT_PEER_OFFSET
+
+
+def chat_admins(peer_id):
+    """Админы и создатель беседы (messages.getConversationMembers; боту нужны права
+    админа в беседе). Список кэшируется на ADMIN_CACHE_MINUTES."""
+    cached = _admin_cache.get(peer_id)
+    if cached and now() - cached[0] < ADMIN_CACHE_MINUTES * 60:
+        return cached[1]
+    admins = set()
+    try:
+        res = vk.messages.getConversationMembers(peer_id=peer_id)
+        for m in res.get("items", []):
+            if m.get("is_admin") or m.get("is_owner"):
+                admins.add(m.get("member_id"))
+    except Exception as e:
+        log.warning("getConversationMembers peer=%s: %s — админы только из ADMIN_IDS", peer_id, e)
+    _admin_cache[peer_id] = (now(), admins)
+    return admins
+
+
+def is_admin(peer_id, user_id):
+    """В личке собеседник — админ своего чата; в беседе — ADMIN_IDS и админы беседы."""
+    if is_private(peer_id):
+        return True
+    return user_id in ADMIN_IDS or user_id in chat_admins(peer_id)
+
+
 # ============ Разбор сообщений: пересланные, картинки, посты ============
 def photo_url(photo):
     """Ссылка на фото подходящего размера: самое большое не больше IMAGE_MAX_SIDE."""
@@ -306,8 +422,9 @@ def photo_url(photo):
 
 
 def shorten(text, limit):
+    """Обрезает текст до limit символов; limit <= 0 — не обрезает."""
     text = (text or "").strip()
-    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+    return text if limit <= 0 or len(text) <= limit else text[:limit].rstrip() + "…"
 
 
 def fetch_wall_post(owner_id, post_id):
@@ -339,7 +456,7 @@ def render_attachments(attachments, images, depth):
             lines.extend(render_wall(obj, images, depth))
         elif t == "wall_reply":
             lines.append(f"[комментарий {display_name(obj.get('from_id', 0))}: "
-                         f"«{shorten(obj.get('text'), POST_MAX_CHARS)}»]")
+                         f"«{(obj.get('text') or '').strip()}»]")
         elif t == "sticker":
             lines.append("[стикер]")
         elif t == "audio_message":
@@ -366,13 +483,13 @@ def render_attachments(attachments, images, depth):
 
 
 def render_wall(post, images, depth):
-    """Текст поста (записи), которым поделились, с репостами и картинками."""
+    """Текст поста (записи), которым поделились, — целиком, с репостами и картинками."""
     if post.get("is_deleted") or post.get("deleted"):
         return ["[запись удалена или недоступна]"]
     if not (post.get("text") or post.get("attachments") or post.get("copy_history")):
         post = fetch_wall_post(post.get("owner_id") or post.get("to_id"), post.get("id")) or post
     author = display_name(post.get("from_id") or post.get("owner_id") or 0)
-    text = shorten(post.get("text"), POST_MAX_CHARS)
+    text = (post.get("text") or "").strip()
     lines = [f"[запись {author}" + (f": «{text}»]" if text else "]")]
     if depth < FWD_MAX_DEPTH:
         lines.extend("  " + l for l in render_attachments(post.get("attachments"), images, depth + 1))
@@ -407,7 +524,8 @@ def render_message(msg, images=None, depth=0):
 
 
 def render_for_history(msg):
-    """Как render_message, но с пометкой, на что это ответ."""
+    """Как render_message, но с пометкой, на что это ответ. Само сообщение, на которое
+    ответили, обычно уже есть в истории, поэтому в пометке — короткая цитата."""
     text, images = render_message(msg)
     rp = msg.get("reply_message")
     if rp:
@@ -431,6 +549,7 @@ def store_vk_message(peer_id, msg):
 
 # ============ VK: отправка ============
 def split_message(text, limit=VK_MESSAGE_LIMIT):
+    """Режет длинный текст на части не длиннее limit: по абзацу, иначе по пробелу, иначе жёстко."""
     parts = []
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -447,9 +566,9 @@ def split_message(text, limit=VK_MESSAGE_LIMIT):
 
 def vk_send(peer_id, text, reply_to_msg=None):
     """
-    Отправляет ответ и сразу сохраняет его в историю (в bot3 ответы бота
-    в историю не попадали). В беседах reply делается через параметр forward
-    с conversation_message_ids: reply_to там не работает, потому что id = 0.
+    Отправляет ответ и сразу сохраняет его в историю. Длинный текст уходит
+    несколькими сообщениями (split_message). В беседах reply делается через
+    параметр forward с conversation_message_ids: reply_to там не работает, потому что id = 0.
     """
     for i, part in enumerate(split_message(text)):
         params = dict(peer_ids=str(peer_id), message=part,
@@ -475,7 +594,45 @@ def vk_send(peer_id, text, reply_to_msg=None):
                        cmid=sent_cmid, vk_msg_id=sent_id)
 
 
+def send_system(peer_id, text, reply_to_msg=None):
+    """Служебное сообщение (помощь, лимиты, пауза): с пометкой SYSTEM_MARK, в контекст не идёт."""
+    vk_send(peer_id, f"{SYSTEM_MARK} {text}", reply_to_msg=reply_to_msg)
+
+
 # ============ Загрузка истории ============
+def fetch_history(peer_id, count, offset=0, stop_before_ts=None):
+    """
+    Загружает из ВК до `count` сообщений диалога (от новых к старым, начиная с offset)
+    и сохраняет их. stop_before_ts — остановиться, как только дошли до сообщений старше.
+    Возвращает (сколько загружено, дошли ли до начала диалога).
+    """
+    collected, reached_start = [], False
+    while len(collected) < count:
+        want = min(200, count - len(collected))
+        try:
+            items = vk.messages.getHistory(peer_id=peer_id, count=want, offset=offset)["items"]
+        except Exception as e:
+            log.warning("getHistory peer=%s: %s", peer_id, e)
+            break
+        collected.extend(items)
+        offset += len(items)
+        if len(items) < want:
+            reached_start = True
+            break
+        if stop_before_ts is not None and min(m.get("date", 0) for m in items) <= stop_before_ts:
+            break
+
+    # ВК отдаёт от новых к старым — разворачиваем
+    collected.reverse()
+    ids = set()
+    for m in collected:
+        collect_author_ids(m, ids)
+    ensure_names(ids)
+    for m in collected:
+        store_vk_message(peer_id, m)
+    return len(collected), reached_start
+
+
 def load_history():
     """
     Первый старт — до INITIAL_LOAD сообщений на диалог, следующие старты —
@@ -496,41 +653,234 @@ def load_history():
     total = 0
     for d in dialogs:
         peer_id = d["conversation"]["peer"]["id"]
-        collected, offset = [], 0
-        while len(collected) < per_peer:
-            try:
-                items = vk.messages.getHistory(
-                    peer_id=peer_id, count=min(200, per_peer - len(collected)), offset=offset,
-                )["items"]
-            except Exception as e:
-                log.warning("getHistory peer=%s: %s", peer_id, e)
-                break
-            if not items:
-                break
-            collected.extend(items)
-            offset += len(items)
-
-        # ВК отдаёт от новых к старым — разворачиваем
-        collected.reverse()
-        ids = set()
-        for m in collected:
-            collect_author_ids(m, ids)
-        ensure_names(ids)
-        for m in collected:
-            store_vk_message(peer_id, m)
-        total += len(collected)
-        log.info("peer=%s загружено %d", peer_id, len(collected))
+        n, reached_start = fetch_history(peer_id, per_peer)
+        if reached_start:
+            db_state_set(f"history_complete_{peer_id}", 1)
+        total += n
+        log.info("peer=%s загружено %d", peer_id, n)
 
     db_state_set("initial_load_done", "1")
     log.info("Загрузка истории завершена, всего %d сообщений.", total)
 
 
+def ensure_history_since(peer_id, start_ts):
+    """
+    Пересказ с даты: если в БД нет сообщений не позже start_ts, догружает
+    историю из ВК (от новых к старым), пока не дойдёт до start_ts или до начала
+    чата. Начало чата запоминается — второй раз грузить не будем.
+    Возвращает число загруженных сообщений.
+    """
+    first_ts, stored = DB.execute(
+        "SELECT MIN(ts), COUNT(*) FROM messages WHERE peer_id=?", (peer_id,)).fetchone()
+    if first_ts is not None and first_ts <= start_ts:
+        return 0
+    if db_state_get(f"history_complete_{peer_id}") == "1":
+        return 0  # раньше start_ts чата не существовало — догружать нечего
+    # сообщения в БД — это последние сообщения диалога, их можно пропустить;
+    # 200 — запас на сообщения, удалённые в ВК, но оставшиеся в БД
+    offset = max(0, stored - 200)
+    n, reached_start = fetch_history(peer_id, HISTORY_LOAD_MAX, offset=offset,
+                                     stop_before_ts=start_ts)
+    if reached_start:
+        db_state_set(f"history_complete_{peer_id}", 1)
+    log.info("peer=%s: для пересказа с %s догружено %d сообщений%s", peer_id,
+             fmt_ts(start_ts), n, " (дошли до начала чата)" if reached_start else "")
+    return n
+
+
+# ============ Настройки беседы: токены, символы, дневной лимит ============
+def _limit_get(key, default):
+    """Настройка беседы в state: 'значение|когда_задано'."""
+    raw = db_state_get(key)
+    if not raw:
+        return default, None
+    value, set_ts = raw.split("|")
+    return int(value), int(set_ts)
+
+
+def tokens_limit(peer_id):
+    """Лимит выходных токенов беседы; через TOKEN_LIMIT_RESET_MINUTES — снова стандарт."""
+    value, set_ts = _limit_get(f"tokens_{peer_id}", MAX_TOKENS_DEFAULT)
+    if set_ts and TOKEN_LIMIT_RESET_MINUTES and now() - set_ts >= TOKEN_LIMIT_RESET_MINUTES * 60:
+        db_state_del(f"tokens_{peer_id}")
+        log.info("peer=%s: лимит токенов вернулся к стандарту %d", peer_id, MAX_TOKENS_DEFAULT)
+        return MAX_TOKENS_DEFAULT
+    return value
+
+
+def chars_limit(peer_id):
+    """Лимит символов истории в запросе к LLM для беседы."""
+    return _limit_get(f"chars_{peer_id}", MAX_CONTEXT_CHARS)[0]
+
+
+def day_key(t=None):
+    """Сутки для дневного лимита: начинаются в LIMIT_RESET_HOUR."""
+    t = now() if t is None else t
+    return (datetime.fromtimestamp(t) - timedelta(hours=LIMIT_RESET_HOUR)).strftime("%Y-%m-%d")
+
+
+def next_reset_dt():
+    d = datetime.fromtimestamp(now()) - timedelta(hours=LIMIT_RESET_HOUR)
+    return datetime(d.year, d.month, d.day) + timedelta(days=1, hours=LIMIT_RESET_HOUR)
+
+
+def daily_state(peer_id):
+    raw = db_state_get(f"daily_{peer_id}")
+    st = json.loads(raw) if raw else {}
+    if st.get("day") != day_key():
+        st = {"day": day_key(), "count": 0, "notified": []}   # новые сутки — лимит сброшен
+    return st
+
+
+def daily_limit_reached(peer_id):
+    return DAILY_MESSAGE_LIMIT > 0 and daily_state(peer_id)["count"] >= DAILY_MESSAGE_LIMIT
+
+
+def count_answer(peer_id):
+    """Учитывает ответ бота в дневном лимите и сообщает о достижении 25/50/90/100 %."""
+    if DAILY_MESSAGE_LIMIT <= 0:
+        return
+    st = daily_state(peer_id)
+    st["count"] += 1
+    crossed = [p for p in LIMIT_NOTIFY_PERCENTS
+               if p not in st["notified"] and st["count"] >= math.ceil(DAILY_MESSAGE_LIMIT * p / 100)]
+    st["notified"].extend(crossed)
+    db_state_set(f"daily_{peer_id}", json.dumps(st))
+    if not crossed:
+        return
+    p = max(crossed)  # при маленьком лимите пороги могут совпасть — сообщаем о старшем
+    if p >= 100:
+        send_system(peer_id, f"Дневной лимит сообщений исчерпан: {st['count']} из "
+                             f"{DAILY_MESSAGE_LIMIT}. До {next_reset_dt():%H:%M %d.%m} "
+                             "бот не будет отвечать. Админ может сбросить лимит командой "
+                             "«/сбросить лимит сообщений».")
+    else:
+        send_system(peer_id, f"Использовано {st['count']} из {DAILY_MESSAGE_LIMIT} "
+                             f"сообщений на сегодня ({p}% дневного лимита).")
+
+
+# ============ Состояние беседы: очередь, пауза, размер контекста ============
+class PeerState:
+    def __init__(self):
+        self.pending = []              # обращения, ждущие ответа: [Request]
+        self.first_pending_ts = 0.0
+        self.last_pending_ts = 0.0
+        self.paused_until = 0.0
+        self.ctx_size = CONTEXT_SIZE
+        self.growing = False           # активный спор: контекст растёт на 1 с каждым сообщением
+        self.last_activity = 0.0       # время последнего сообщения людей
+        self.last_answer_ts = 0.0
+        self.last_interval = None      # время между двумя последними ответами бота
+
+
+def peer_state(peer_id):
+    if peer_id not in PEERS:
+        PEERS[peer_id] = PeerState()
+    return PEERS[peer_id]
+
+
+def reset_context_size_if_quiet(st, t):
+    if st.last_activity and t - st.last_activity >= CONTEXT_RESET_MINUTES * 60:
+        st.ctx_size = CONTEXT_SIZE
+        st.growing = False
+        st.last_answer_ts = 0.0
+        st.last_interval = None
+
+
+def note_activity(peer_id, t=None):
+    """Новое сообщение людей: после тишины — контекст к исходному, в споре — +1."""
+    t = now() if t is None else t
+    st = peer_state(peer_id)
+    reset_context_size_if_quiet(st, t)
+    if st.growing:
+        st.ctx_size = min(st.ctx_size + 1, CONTEXT_SIZE_MAX)
+    st.last_activity = t
+
+
+def note_bot_answer(peer_id, t=None):
+    """Ответ бота: если время между ответами уменьшается — начался активный спор."""
+    t = now() if t is None else t
+    st = peer_state(peer_id)
+    if st.last_answer_ts:
+        interval = t - st.last_answer_ts
+        if st.last_interval is not None and interval < st.last_interval and not st.growing:
+            st.growing = True
+            log.info("peer=%s: активный спор, контекст растёт (сейчас %d)", peer_id, st.ctx_size)
+        st.last_interval = interval
+    st.last_answer_ts = t
+
+
+def context_size(peer_id):
+    st = peer_state(peer_id)
+    reset_context_size_if_quiet(st, now())
+    return st.ctx_size
+
+
+def is_paused(peer_id):
+    return peer_state(peer_id).paused_until > now()
+
+
+class Request:
+    """Обращение к боту: сообщение ВК + то, что о нём уже известно."""
+
+    def __init__(self, message, rowid=None, text="", images=(), command=None):
+        self.message = message
+        self.peer_id = message["peer_id"]
+        self.from_id = message.get("from_id", 0)
+        self.ts = message.get("date") or int(time.time())
+        self.rowid = rowid
+        self.text = text
+        self.images = list(images)
+        self.command = command         # (имя, аргумент) — для команд, отложенных паузой
+
+
+def enqueue(req):
+    st = peer_state(req.peer_id)
+    t = now()
+    if not st.pending:
+        st.first_pending_ts = t
+    st.last_pending_ts = t
+    st.pending.append(req)
+
+
+def process_pending(t=None):
+    """
+    Отвечает на накопленные обращения: когда BATCH_WAIT_SEC не было новых обращений
+    (или с первого прошло BATCH_MAX_WAIT_SEC) и беседа не на паузе. Вызывается из
+    главного цикла после каждой проверки Long Poll.
+    """
+    t = now() if t is None else t
+    for peer_id, st in list(PEERS.items()):
+        if st.paused_until > t:
+            continue
+        resumed = bool(st.paused_until)     # пауза только что кончилась — отвечаем сразу
+        st.paused_until = 0.0
+        if st.pending and (resumed
+                           or t - st.last_pending_ts >= BATCH_WAIT_SEC
+                           or t - st.first_pending_ts >= BATCH_MAX_WAIT_SEC):
+            flush(peer_id)
+
+
+def flush(peer_id):
+    st = peer_state(peer_id)
+    items, st.pending = st.pending, []
+    for req in items:
+        if req.command:
+            try:
+                run_llm_command(req)
+            except Exception as e:
+                log.exception("команда %s: %s", req.command[0], e)
+    msgs = [r for r in items if not r.command]
+    if msgs:
+        answer_batch(peer_id, msgs)
+
+
 # ============ LLM ============
 def build_system_prompt(role):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    t = datetime.fromtimestamp(now()).strftime("%Y-%m-%d %H:%M")
     return (
         f"{role}\n\n"
-        f"Сейчас: {now}.\n"
+        f"Сейчас: {t}.\n"
         "Ты пишешь в чате ВКонтакте от лица сообщества. Отвечай кратко и по делу, "
         "если не просят длинного ответа. Используй живой язык. "
         "Пересланные сообщения помечены «[переслано от …]», посты — «[запись …]», "
@@ -539,19 +889,97 @@ def build_system_prompt(role):
     )
 
 
-def format_context(rows, max_chars=MAX_CONTEXT_CHARS):
-    """rows: [(from_id, is_bot, text, ts, images), ...] — старые → новые."""
-    lines = []
-    for from_id, is_bot, text, ts, _images in rows:
-        if not text:
+def fmt_ts(ts):
+    return datetime.fromtimestamp(ts).strftime("%H:%M %d.%m.%Y")
+
+
+def format_line(from_id, is_bot, text, ts):
+    who = BOT_NAME if is_bot or from_id == BOT_GROUP_ID else display_name(from_id)
+    t = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+    return f"[{t}] {who}: {text}"
+
+
+def context_lines(rows):
+    """[(id, строка), ...] без пустых и служебных сообщений бота."""
+    out = []
+    for rid, from_id, is_bot, text, ts, _images in rows:
+        if not text or (is_bot and text.startswith(SYSTEM_MARK)):
             continue
-        who = BOT_NAME if is_bot or from_id == BOT_GROUP_ID else display_name(from_id)
-        t = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
-        lines.append(f"[{t}] {who}: {text}")
-    # не даём истории раздуть запрос: выбрасываем самые старые строки
-    while lines and sum(len(l) + 1 for l in lines) > max_chars:
+        out.append((rid, format_line(from_id, is_bot, text, ts)))
+    return out
+
+
+def _size(lines):
+    return sum(len(l) + 1 for _, l in lines)
+
+
+def format_context(rows, max_chars=MAX_CONTEXT_CHARS):
+    """История без сжатия: если не влезает в max_chars — выбрасываем самые старые строки."""
+    lines = context_lines(rows)
+    while lines and _size(lines) > max_chars:
         lines.pop(0)
-    return "\n".join(lines)
+    return "\n".join(l for _, l in lines)
+
+
+def compress_lines(previous_summary, lines):
+    """Сжимает старую часть истории (и прежний пересказ) в пересказ ≤ CONTEXT_SUMMARY_CHARS."""
+    old = "\n".join(l for _, l in lines)
+    prompt = (
+        f"Сожми начало переписки в чате в краткий пересказ не длиннее {CONTEXT_SUMMARY_CHARS} "
+        "символов: кто что утверждал, о чём спорили, к чему пришли, открытые вопросы. "
+        "Сохрани имена. Пиши только пересказ.\n\n"
+        + (f"ПРЕЖНИЙ ПЕРЕСКАЗ:\n{previous_summary}\n\n" if previous_summary else "")
+        + f"СООБЩЕНИЯ:\n{old}"
+    )
+    summary = llm_call("Ты сжимаешь историю чата для памяти собеседника.", prompt,
+                       max_tokens=max(300, CONTEXT_SUMMARY_CHARS // 2))
+    return shorten(summary, CONTEXT_SUMMARY_CHARS)
+
+
+def build_history(peer_id, rows, max_chars):
+    """
+    История для запроса. Влезает в max_chars — как есть. Не влезает (в активном споре
+    контекст растёт) — старая часть сжимается в пересказ, а свежие сообщения идут
+    дословно. Пересказ хранится в БД (ctxsum_<peer>) и дополняется, только когда
+    свежая часть снова перестала помещаться, — LLM не вызывается на каждом ответе.
+    """
+    lines = context_lines(rows)
+    if _size(lines) <= max_chars:
+        return "\n".join(l for _, l in lines)
+
+    ids = [rid for rid, _ in lines]
+    raw = db_state_get(f"ctxsum_{peer_id}")
+    cache = json.loads(raw) if raw else None
+    avail = max(max_chars - CONTEXT_SUMMARY_CHARS, 0)
+    base, candidates, first_id = "", lines, ids[0]
+    if cache and cache["first_id"] <= ids[0] and cache["last_id"] in ids:
+        fresh = lines[ids.index(cache["last_id"]) + 1:]
+        if _size(fresh) <= avail:
+            return summary_block(cache["text"], fresh)
+        base, candidates, first_id = cache["text"], fresh, cache["first_id"]
+
+    # свежая часть — с запасом, чтобы следующие сообщения тоже поместились без сжатия
+    keep = []
+    for item in reversed(candidates):
+        if _size(keep) + len(item[1]) + 1 > avail * CONTEXT_KEEP_SHARE:
+            break
+        keep.insert(0, item)
+    old = candidates[:len(candidates) - len(keep)]
+    summary = compress_lines(base, old) if old else base
+    if not summary:
+        log.warning("peer=%s: не удалось сжать историю — обрезаю старые сообщения", peer_id)
+        return format_context(rows, max_chars)
+    db_state_set(f"ctxsum_{peer_id}", json.dumps(
+        {"first_id": first_id, "last_id": old[-1][0] if old else cache["last_id"],
+         "text": summary}, ensure_ascii=False))
+    log.info("peer=%s: %d старых сообщений сжато в пересказ (%d символов)",
+             peer_id, len(old), len(summary))
+    return summary_block(summary, keep)
+
+
+def summary_block(summary, lines):
+    body = "\n".join(l for _, l in lines)
+    return f"(Пересказ более ранней части беседы: {summary})\n{body}".rstrip()
 
 
 def _image_part(url):
@@ -577,7 +1005,7 @@ def _rate_limit():
     _last_llm_call = time.time()
 
 
-def llm_call(system, user_text, max_tokens=800, images=()):
+def llm_call(system, user_text, max_tokens=MAX_TOKENS_DEFAULT, images=()):
     images = list(dict.fromkeys(images))[:MAX_IMAGES_PER_REQUEST]
     content = user_text
     if images:
@@ -607,52 +1035,50 @@ def clean_answer(text):
     return re.sub(rf"^\s*(\[[^\]]*\]\s*)?({re.escape(BOT_NAME)}|Грань)\s*:\s*", "", text or "").strip()
 
 
-def ask_gran(peer_id, new_text, context_rows, images=()):
+def ask_gran(peer_id, requests, context_rows, images=()):
+    """Один запрос к LLM на одно или несколько обращений, накопившихся за BATCH_WAIT_SEC."""
     system = build_system_prompt(db_get_role(peer_id))
-    ctx = format_context(context_rows)
+    ctx = build_history(peer_id, context_rows, chars_limit(peer_id))
     log.debug("КОНТЕКСТ peer=%s:\n%s", peer_id, ctx)
 
     history = f"ИСТОРИЯ:\n{ctx}\n\n" if ctx else "Истории нет — это первое сообщение.\n\n"
+    new = "\n".join(format_line(r.from_id, False, r.text, r.ts) for r in requests)
+    if len(requests) == 1:
+        task = f"НОВОЕ СООБЩЕНИЕ:\n{new}\n\n"
+    else:
+        task = (f"НОВЫЕ СООБЩЕНИЯ (их {len(requests)}, ответь на все одним сообщением, "
+                f"обращаясь к авторам по имени):\n{new}\n\n")
     prompt = (
-        "Ниже история чата (старые сообщения сверху, новые снизу) и новое "
-        "сообщение, на которое надо ответить.\n\n"
-        f"{history}"
-        f"НОВОЕ СООБЩЕНИЕ:\n{new_text}\n\n"
-        + ("К запросу приложены картинки из нового сообщения и последних сообщений истории.\n\n"
+        "Ниже история чата (старые сообщения сверху, новые снизу) и новые "
+        "сообщения, на которые надо ответить.\n\n"
+        f"{history}{task}"
+        + ("К запросу приложены картинки из новых сообщений и последних сообщений истории.\n\n"
            if images else "")
         + "Ответь как Грань."
     )
-    return clean_answer(llm_call(system, prompt, images=images))
+    return clean_answer(llm_call(system, prompt, max_tokens=tokens_limit(peer_id), images=images))
 
 
-def summarize(peer_id, count):
-    """Пересказ последних N сообщений — без фильтра по времени."""
+def summarize_rows(peer_id, rows):
     system = build_system_prompt(db_get_role(peer_id))
-    rows = db_get_context(peer_id, min(count, SUMMARY_MAX_INPUT))
-    if not rows:
-        return "Нечего пересказывать."
     ctx = format_context(rows, max_chars=SUMMARY_MAX_INPUT * 200)
     prompt = (
         "Ниже — история чата. Сделай краткий, но содержательный пересказ: "
         "о чём говорили, ключевые темы, кто что утверждал, к чему пришли.\n\n"
         f"{ctx}"
     )
-    return llm_call(system, prompt, max_tokens=1500)
+    return llm_call(system, prompt, max_tokens=max(SUMMARY_MAX_TOKENS, tokens_limit(peer_id)))
 
 
-def summarize_text(text, images=()):
+def summarize_text(peer_id, text, images=()):
     system = "Ты — полезный помощник, который делает краткое резюме текста."
     prompt = f"Перескажи суть следующего текста кратко и по делу:\n\n{text}"
-    return llm_call(system, prompt, max_tokens=1200, images=images)
+    return llm_call(system, prompt, max_tokens=max(1200, tokens_limit(peer_id)), images=images)
 
 
 # ============ Парсинг команд ============
 def has_trigger(text):
     return bool(TRIGGER_RE.search(text or ""))
-
-
-def is_private(peer_id):
-    return 0 < peer_id < CHAT_PEER_OFFSET
 
 
 def is_reply_to_bot(message):
@@ -661,24 +1087,19 @@ def is_reply_to_bot(message):
 
 
 def is_addressed_to_bot(message):
-    """Обращение к боту: слово «грань», reply на сообщение бота или личка."""
+    """Обращение к боту: слово «грань», reply на сообщение бота или личка (если разрешена)."""
     return (has_trigger(message.get("text"))
             or is_reply_to_bot(message)
-            or (RESPOND_IN_PRIVATE and is_private(message.get("peer_id", 0))))
+            or (ALLOW_PRIVATE_MESSAGES and is_private(message.get("peer_id", 0))))
 
 
 def should_respond(message_ts):
-    return (int(time.time()) - message_ts) <= FRESHNESS_MINUTES * 60
+    return (int(now()) - message_ts) <= FRESHNESS_MINUTES * 60
 
 
 def extract_role(text):
     m = re.search(r"/роль\s*\(([^)]*)\)", text, re.IGNORECASE | re.DOTALL)
     return m.group(1).strip() if m else None
-
-
-def extract_summary_count(text):
-    m = re.search(r"/пересказ\s+(\d+)", text, re.IGNORECASE)
-    return int(m.group(1)) if m else None
 
 
 def is_summary_request(text):
@@ -687,12 +1108,72 @@ def is_summary_request(text):
         or ("грань, о чем тут" in low)
 
 
-def is_forget_request(text):
-    return bool(re.search(r"(^|\s)/забудь\b", text or "", re.IGNORECASE))
-
-
 def is_stop_request(text):
     return STOP_PHRASE in (text or "").lower()
+
+
+def parse_start_time(s, t=None):
+    """
+    Дата начала для «/пересказ N от …»: «12:00 16.10.2026», «16.10.2026 12:00»,
+    «16.10.2026», «16.10» (этот год), «12:00» (сегодня), год можно двумя цифрами.
+    Дата без года или время без даты в будущем — значит, прошлый год / вчера.
+    Возвращает timestamp или None.
+    """
+    cur = datetime.fromtimestamp(now() if t is None else t)
+    tm = re.search(r"\b(\d{1,2}):(\d{2})\b", s or "")
+    dm = re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{4}|\d{2}))?\b", s or "")
+    if not tm and not dm:
+        return None
+    hour, minute = (int(tm.group(1)), int(tm.group(2))) if tm else (0, 0)
+    try:
+        if dm:
+            year = int(dm.group(3)) if dm.group(3) else cur.year
+            year += 2000 if year < 100 else 0
+            dt = datetime(year, int(dm.group(2)), int(dm.group(1)), hour, minute)
+            if not dm.group(3) and dt > cur:
+                dt = dt.replace(year=dt.year - 1)
+        else:
+            dt = cur.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if dt > cur:
+                dt -= timedelta(days=1)
+    except ValueError:
+        return None
+    return int(dt.timestamp())
+
+
+_LIMIT_ARG = r"(?:\s+(\d+|сброс|стандарт))?"
+COMMAND_PATTERNS = [
+    ("помощь", re.compile(r"(?:^|\s)/помощь\b", re.IGNORECASE)),
+    ("пауза", re.compile(r"(?:^|\s)/пауза\b(?:\s+(\d+))?", re.IGNORECASE)),
+    ("лимит токенов", re.compile(r"(?:^|\s)/лимит\s+токенов\b" + _LIMIT_ARG, re.IGNORECASE)),
+    ("лимит символов", re.compile(r"(?:^|\s)/лимит\s+символов\b" + _LIMIT_ARG, re.IGNORECASE)),
+    ("сбросить лимит", re.compile(r"(?:^|\s)/сбросить\s+лимит\s+сообщений\b", re.IGNORECASE)),
+    ("забудь", re.compile(r"(?:^|\s)/забудь\b", re.IGNORECASE)),
+    ("пересказ", re.compile(r"(?:^|\s)/пересказ\b(?:\s+(\d+))?(?:\s+(?:от|с)\s+(.+))?",
+                            re.IGNORECASE | re.DOTALL)),
+    ("мысль", re.compile(r"(?:^|\s)/мысль\b(?:\s+(подробно))?", re.IGNORECASE)),
+]
+
+
+def parse_command(text):
+    """(имя, аргумент) первой найденной команды или None."""
+    text = text or ""
+    if is_stop_request(text):
+        return ("стоп", None)
+    role = extract_role(text)
+    if role:
+        return ("роль", role)
+    for name, rx in COMMAND_PATTERNS:
+        m = rx.search(text)
+        if not m:
+            continue
+        if name == "пересказ":
+            return (name, (int(m.group(1)) if m.group(1) else None,
+                           m.group(2).strip() if m.group(2) else None))
+        if name == "мысль":
+            return (name, bool(m.group(1)))
+        return (name, m.group(1) if m.groups() else None)
+    return None
 
 
 def quoted_content(message):
@@ -709,14 +1190,243 @@ def quoted_content(message):
     return text, images
 
 
+# ============ Команды ============
+# (имя, как вызвать, кто может, что делает) — по этой таблице строится /помощь
+HELP = [
+    ("обращение", "«Грань, …» или reply на сообщение бота", "все",
+     f"ответ бота; обращения за {BATCH_WAIT_SEC} с собираются и получают один общий ответ"),
+    ("перескажи", "«Грань, перескажи» / «Грань, о чём тут» (reply, пересланные или пост)", "все",
+     "пересказ сообщения, на которое ответили, пересланных или поста"),
+    ("пересказ", "/пересказ N", "все; больше "
+     f"{SUMMARY_FREE_MAX} сообщений — админ", "пересказ последних N сообщений беседы"),
+    ("пересказ от", "/пересказ N от ЧЧ:ММ ДД.ММ.ГГГГ", "все; больше "
+     f"{SUMMARY_FREE_MAX} сообщений — админ",
+     "пересказ N сообщений начиная с даты; недостающая история догружается из ВК"),
+    ("мысль", "/мысль", "все", "случайная философская мысль"),
+    ("мысль подробно", "/мысль подробно", "все",
+     "мысль со всей цепочкой: случайные слова → образ и роль → вопрос → ответ"),
+    ("пауза", "/пауза [минуты]", "все",
+     f"не отвечать {PAUSE_DEFAULT_MINUTES} мин (до {PAUSE_MAX_MINUTES}), потом ответить на всё "
+     "накопившееся; «/пауза 0» — снять паузу"),
+    ("забудь", "/забудь", "все", "начать контекст беседы с чистого листа (история в БД остаётся)"),
+    ("роль", "/роль (текст)", "все", "задать боту роль в этой беседе"),
+    ("помощь", "/помощь", "все", "этот список и текущие настройки беседы"),
+    ("лимит токенов", "/лимит токенов N / сброс", "админ",
+     f"лимит длины ответа в токенах (стандарт {MAX_TOKENS_DEFAULT}"
+     + (f", сам возвращается через {TOKEN_LIMIT_RESET_MINUTES} мин" if TOKEN_LIMIT_RESET_MINUTES
+        else "") + ")"),
+    ("лимит символов", "/лимит символов N / сброс", "админ",
+     f"сколько символов истории передавать модели (стандарт {MAX_CONTEXT_CHARS}); "
+     "что не влезло — сжимается в пересказ"),
+    ("сбросить лимит", "/сбросить лимит сообщений", "админ",
+     f"обнулить дневной лимит ответов ({DAILY_MESSAGE_LIMIT} в сутки)"),
+    ("стоп", f"«{STOP_PHRASE.capitalize()}»", "все", "остановить бота"),
+]
+ADMIN_COMMANDS = {"лимит токенов", "лимит символов", "сбросить лимит"}
+LLM_COMMANDS = {"пересказ", "мысль", "перескажи"}   # на паузе откладываются, расходуют лимит
+
+
+def help_text(peer_id):
+    lines = ["Команды бота «Грань»:", ""]
+    for _name, usage, who, what in HELP:
+        lines.append(f"• {usage} — {what}. Кто: {who}.")
+    st = daily_state(peer_id)
+    lines += [
+        "",
+        "Админ — админ или создатель беседы (боту нужны права админа в беседе); "
+        "в личных сообщениях собеседнику доступны все команды.",
+        "",
+        "Сейчас в этой беседе:",
+        f"• лимит токенов ответа: {tokens_limit(peer_id)}",
+        f"• лимит символов истории: {chars_limit(peer_id)}",
+        f"• контекст: {context_size(peer_id)} сообщений (обычно {CONTEXT_SIZE})",
+        "• ответов сегодня: " + (f"{st['count']} из {DAILY_MESSAGE_LIMIT}" if DAILY_MESSAGE_LIMIT > 0
+                                 else f"{st['count']} (без лимита)"),
+    ]
+    if is_paused(peer_id):
+        lines.append(f"• пауза до {datetime.fromtimestamp(peer_state(peer_id).paused_until):%H:%M:%S}")
+    return "\n".join(lines)
+
+
+def needs_admin(cmd):
+    name, arg = cmd
+    if name in ADMIN_COMMANDS:
+        return True
+    return name == "пересказ" and (arg[0] or SUMMARY_DEFAULT_COUNT) > SUMMARY_FREE_MAX
+
+
+def run_command(req):
+    """Выполняет команду. Служебные — сразу; требующие LLM на паузе ждут её конца."""
+    global STOP_REQUESTED
+    peer_id, message = req.peer_id, req.message
+    name, arg = req.command
+
+    if needs_admin(req.command) and not is_admin(peer_id, req.from_id):
+        what = (f"Пересказ больше {SUMMARY_FREE_MAX} сообщений" if name == "пересказ"
+                else "Эта команда")
+        send_system(peer_id, f"{what} доступна только админу беседы.", reply_to_msg=message)
+        return
+
+    if name in LLM_COMMANDS:
+        if is_paused(peer_id):
+            enqueue(req)
+        else:
+            run_llm_command(req)
+        return
+
+    if name == "стоп":
+        vk_send(peer_id, "Останавливаюсь.", reply_to_msg=message)
+        log.info("Команда остановки от peer=%s", peer_id)
+        db_state_set("stopped_at", int(now()))
+        STOP_REQUESTED = True
+    elif name == "роль":
+        db_set_role(peer_id, arg)
+        vk_send(peer_id, "Роль обновлена.", reply_to_msg=message)
+    elif name == "забудь":
+        # сбросить контекст беседы, история в БД остаётся
+        db_state_set(f"forget_{peer_id}", req.ts + 1)
+        db_state_del(f"ctxsum_{peer_id}")
+        vk_send(peer_id, "Хорошо, начинаю с чистого листа.", reply_to_msg=message)
+    elif name == "помощь":
+        send_system(peer_id, help_text(peer_id), reply_to_msg=message)
+    elif name == "пауза":
+        cmd_pause(req, arg)
+    elif name == "лимит токенов":
+        cmd_limit(req, arg, "tokens", "Лимит выходных токенов", MAX_TOKENS_DEFAULT,
+                  MAX_TOKENS_CAP, tokens_limit)
+    elif name == "лимит символов":
+        cmd_limit(req, arg, "chars", "Лимит символов истории", MAX_CONTEXT_CHARS,
+                  MAX_CONTEXT_CHARS_CAP, chars_limit)
+    elif name == "сбросить лимит":
+        db_state_del(f"daily_{peer_id}")
+        send_system(peer_id, f"Дневной лимит сообщений сброшен: 0 из {DAILY_MESSAGE_LIMIT}.",
+                    reply_to_msg=message)
+
+
+def cmd_pause(req, arg):
+    st = peer_state(req.peer_id)
+    minutes = PAUSE_DEFAULT_MINUTES if arg is None else min(int(arg), PAUSE_MAX_MINUTES)
+    if minutes <= 0:
+        st.paused_until = now() if st.paused_until > now() else 0.0  # process_pending ответит сразу
+        send_system(req.peer_id, "Пауза снята.", reply_to_msg=req.message)
+        return
+    st.paused_until = now() + minutes * 60
+    send_system(req.peer_id, f"Пауза {minutes} мин: пока не отвечаю, потом отвечу "
+                             "на всё, что накопится.", reply_to_msg=req.message)
+
+
+def cmd_limit(req, arg, key, title, default, cap, getter):
+    """/лимит токенов и /лимит символов: без числа — показать, «сброс» — к стандарту."""
+    peer_id = req.peer_id
+    if arg is None:
+        send_system(peer_id, f"{title}: {getter(peer_id)} (стандарт {default}). "
+                             f"Изменить: «/лимит {'токенов' if key == 'tokens' else 'символов'} "
+                             "N», вернуть стандарт: «… сброс».", reply_to_msg=req.message)
+        return
+    if not arg.isdigit():
+        db_state_del(f"{key}_{peer_id}")
+        send_system(peer_id, f"{title} возвращён к стандарту: {default}.", reply_to_msg=req.message)
+        return
+    value = min(max(int(arg), 1), cap)
+    db_state_set(f"{key}_{peer_id}", f"{value}|{int(now())}")
+    note = ""
+    if key == "tokens" and TOKEN_LIMIT_RESET_MINUTES:
+        note = f" Через {TOKEN_LIMIT_RESET_MINUTES} мин вернётся к стандарту {default}."
+    send_system(peer_id, f"{title}: {value}." + (f" (максимум {cap})" if int(arg) > cap else "")
+                + note, reply_to_msg=req.message)
+
+
+def llm_reply(req, produce, fail_text):
+    """Ответ, на который нужен LLM: проверка дневного лимита, генерация, отправка, учёт."""
+    if daily_limit_reached(req.peer_id):
+        send_system(req.peer_id, LIMIT_REACHED_TEXT, reply_to_msg=req.message)
+        return False
+    answer = produce()
+    vk_send(req.peer_id, answer or fail_text, reply_to_msg=req.message)
+    if answer:
+        count_answer(req.peer_id)
+        note_bot_answer(req.peer_id)
+    return bool(answer)
+
+
+def run_llm_command(req):
+    name, arg = req.command
+    peer_id = req.peer_id
+    if name == "перескажи":
+        target, target_images = quoted_content(req.message)
+        llm_reply(req, lambda: summarize_text(peer_id, target, target_images),
+                  "Не получилось пересказать.")
+    elif name == "мысль":
+        def produce():
+            ask = lambda system, prompt: llm_call(system, prompt, max_tokens=tokens_limit(peer_id))
+            steps = FILOSOF.generate(ask)
+            return filosof.format_thought(steps, detailed=arg) if steps["answer"] else ""
+        llm_reply(req, produce, "Мысль не родилась — попробуйте позже.")
+    elif name == "пересказ":
+        cmd_summary(req, *arg)
+
+
+def cmd_summary(req, count, start):
+    """/пересказ N — последние N сообщений; /пересказ N от ДАТА — N сообщений с даты."""
+    peer_id = req.peer_id
+    count = min(max(count or SUMMARY_DEFAULT_COUNT, 1), SUMMARY_MAX_INPUT)
+    if start is None:
+        rows = db_get_context(peer_id, count, exclude_ids=[req.rowid] if req.rowid else ())
+        if not rows:
+            vk_send(peer_id, "Нечего пересказывать.", reply_to_msg=req.message)
+            return
+        title = f"Пересказ последних {len(rows)} сообщений"
+    else:
+        start_ts = parse_start_time(start)
+        if start_ts is None:
+            send_system(peer_id, "Не понял дату. Пример: «/пересказ 100 от 12:00 16.10.2026».",
+                        reply_to_msg=req.message)
+            return
+        if daily_limit_reached(peer_id):
+            send_system(peer_id, LIMIT_REACHED_TEXT, reply_to_msg=req.message)
+            return
+        ensure_history_since(peer_id, start_ts)
+        rows = db_get_range(peer_id, start_ts, count, exclude_ids=[req.rowid] if req.rowid else ())
+        if not rows:
+            vk_send(peer_id, f"С {fmt_ts(start_ts)} сообщений нет.", reply_to_msg=req.message)
+            return
+        title = f"Пересказ {len(rows)} сообщений с {fmt_ts(rows[0][4])} по {fmt_ts(rows[-1][4])}"
+        if rows[0][4] > start_ts + 3600 and db_state_get(f"history_complete_{peer_id}") == "1":
+            title += f" (раньше {fmt_ts(rows[0][4])} сообщений в чате нет)"
+    llm_reply(req, lambda: (lambda s: f"{title}:\n\n{s}" if s else "")(summarize_rows(peer_id, rows)),
+              "Не получилось пересказать.")
+
+
+def answer_batch(peer_id, requests):
+    """Один ответ на все обращения, накопившиеся за BATCH_WAIT_SEC (или за паузу)."""
+    last = requests[-1]
+    exclude = [r.rowid for r in requests if r.rowid]
+
+    def produce():
+        forget_ts = int(db_state_get(f"forget_{peer_id}", 0))
+        since = int(now()) - CONTEXT_MEMORY_HOURS * 3600 if CONTEXT_MEMORY_HOURS else None
+        ctx_rows = db_get_context(peer_id, context_size(peer_id), since_ts=since,
+                                  min_rows=CONTEXT_MIN_MESSAGES, exclude_ids=exclude,
+                                  after_ts=forget_ts)
+        # картинки: из новых сообщений, затем из самых свежих сообщений истории
+        images = [u for r in requests for u in r.images]
+        for row in reversed(ctx_rows):
+            if len(images) >= MAX_IMAGES_PER_REQUEST:
+                break
+            images.extend(row[5])
+        return ask_gran(peer_id, requests, ctx_rows, images)
+
+    if len(requests) > 1:
+        log.info("peer=%s: один ответ на %d обращений", peer_id, len(requests))
+    llm_reply(last, produce, "Не получилось сформулировать ответ.")
+
+
 # ============ Обработчик ============
 def handle_message(message):
-    global STOP_REQUESTED
-
     peer_id = message["peer_id"]
     from_id = message.get("from_id", 0)
     text = message.get("text") or ""
-    ts = message.get("date", int(time.time()))
+    ts = message.get("date", int(now()))
 
     # имена авторов (в т.ч. пересланных и постов) — одним пакетом до рендеринга
     try:
@@ -728,72 +1438,41 @@ def handle_message(message):
 
     if from_id == BOT_GROUP_ID or from_id < 0:
         return  # свои сообщения и сообщения других ботов только сохраняем
+    if is_private(peer_id) and not ALLOW_PRIVATE_MESSAGES:
+        return  # в личке бот молчит, пока это не разрешено настройкой
 
-    # ---- стоп-машина ----
-    if is_stop_request(text):
-        vk_send(peer_id, "Останавливаюсь.", reply_to_msg=message)
-        log.info("Команда остановки от peer=%s", peer_id)
-        db_state_set("stopped_at", int(time.time()))
-        STOP_REQUESTED = True
-        return
+    note_activity(peer_id, now())
+    req = Request(message, rowid, full_text, images)
 
-    # ---- /роль (...) ----
-    new_role = extract_role(text)
-    if new_role:
-        db_set_role(peer_id, new_role)
-        vk_send(peer_id, "Роль обновлена.", reply_to_msg=message)
-        return
-
-    # ---- /забудь ---- (сбросить контекст беседы, история в БД остаётся)
-    if is_forget_request(text):
-        db_state_set(f"forget_{peer_id}", ts + 1)
-        vk_send(peer_id, "Хорошо, начинаю с чистого листа.", reply_to_msg=message)
-        return
-
-    # ---- /пересказ N ---- (без фильтра по времени)
-    cnt = extract_summary_count(text)
-    if cnt:
-        cnt = min(max(cnt, 1), SUMMARY_MAX_INPUT)
-        vk_send(peer_id, f"Пересказ последних {cnt} сообщений:\n\n{summarize(peer_id, cnt)}",
-                reply_to_msg=message)
+    cmd = parse_command(text)
+    if cmd is None and has_trigger(text) and is_summary_request(text) and quoted_content(message)[0]:
+        cmd = ("перескажи", None)
+    if cmd:
+        req.command = cmd
+        run_command(req)
         return
 
     if not is_addressed_to_bot(message):
         return
-
-    # ---- пересказ reply / пересланного / поста ----
-    if has_trigger(text) and is_summary_request(text):
-        target, target_images = quoted_content(message)
-        if target:
-            vk_send(peer_id, summarize_text(target, target_images) or "Не получилось пересказать.",
-                    reply_to_msg=message)
-            return
-
     if not should_respond(ts):
         log.info("Сообщение старое — не отвечаем.")
         return
+    enqueue(req)  # ответ — в process_pending, когда все допишут
 
-    forget_ts = int(db_state_get(f"forget_{peer_id}", 0))
-    since = int(time.time()) - CONTEXT_MEMORY_HOURS * 3600
-    ctx_rows = db_get_context(peer_id, CONTEXT_SIZE, since_ts=since,
-                              min_rows=CONTEXT_MIN_MESSAGES, exclude_id=rowid,
-                              after_ts=forget_ts)
 
-    # картинки: из нового сообщения, затем из самых свежих сообщений истории
-    all_images = list(images)
-    for row in reversed(ctx_rows):
-        if len(all_images) >= MAX_IMAGES_PER_REQUEST:
-            break
-        all_images.extend(row[4])
-
-    answer = ask_gran(peer_id, full_text, ctx_rows, all_images) or "Не получилось сформулировать ответ."
-    vk_send(peer_id, answer, reply_to_msg=message)
+def handle_event(event):
+    from vk_api.bot_longpoll import VkBotEventType
+    if event.type == VkBotEventType.MESSAGE_NEW:
+        handle_message(event.object.message)
+    elif event.type == VkBotEventType.MESSAGE_REPLY:
+        # исходящие сообщения сообщества (в т.ч. написанные админом вручную)
+        store_vk_message(event.object["peer_id"], dict(event.object))
 
 
 # ============ Main ============
 def init():
     """Подключение к БД, ВК и LLM. Импорты здесь, чтобы тесты не требовали токенов."""
-    global DB, vk, llm_client, BOT_GROUP_ID, VK_USER_TOKEN
+    global DB, vk, llm_client, BOT_GROUP_ID, VK_USER_TOKEN, ADMIN_IDS
     from dotenv import load_dotenv
     import vk_api
     from vk_api.bot_longpoll import VkBotLongPoll
@@ -803,12 +1482,13 @@ def init():
     group_id = int(os.getenv("VK_GROUP_ID"))
     BOT_GROUP_ID = -group_id
     VK_USER_TOKEN = os.getenv("VK_USER_TOKEN") or None
+    ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS") or "")}
     DB = db_init(DB_PATH)
-    migrate_from_bot3()
+    migrate_from_bot4()
     session = vk_api.VkApi(token=os.getenv("VK_TOKEN"))
     vk = session.get_api()
     llm_client = OpenAI(api_key=os.getenv("PROXYAPI_KEY"), base_url=PROXYAPI_BASE_URL)
-    return VkBotLongPoll(session, group_id)
+    return VkBotLongPoll(session, group_id, wait=LONGPOLL_WAIT_SEC)
 
 
 def _graceful_signal(signum, frame):
@@ -818,8 +1498,6 @@ def _graceful_signal(signum, frame):
 
 
 def main():
-    from vk_api.bot_longpoll import VkBotEventType
-
     signal.signal(signal.SIGINT, _graceful_signal)
     signal.signal(signal.SIGTERM, _graceful_signal)
 
@@ -827,24 +1505,26 @@ def main():
     load_history()
     log.info("Слушаем Long Poll... (для остановки: '%s')", STOP_PHRASE)
 
+    # check() вместо listen(): Long Poll возвращается раз в LONGPOLL_WAIT_SEC,
+    # и между проверками бот отвечает на накопившиеся обращения
     while not STOP_REQUESTED:
         try:
-            for event in longpoll.listen():
-                if STOP_REQUESTED:
-                    break
+            for event in longpoll.check():
                 try:
-                    if event.type == VkBotEventType.MESSAGE_NEW:
-                        handle_message(event.object.message)
-                    elif event.type == VkBotEventType.MESSAGE_REPLY:
-                        # исходящие сообщения сообщества (в т.ч. написанные админом вручную)
-                        store_vk_message(event.object["peer_id"], dict(event.object))
-                    if STOP_REQUESTED:
-                        break
+                    handle_event(event)
                 except Exception as e:
                     log.exception("handle: %s", e)
+                if STOP_REQUESTED:
+                    break
         except Exception as e:
             log.error("longpoll error: %s", e)
             time.sleep(3)
+        if STOP_REQUESTED:
+            break
+        try:
+            process_pending()
+        except Exception as e:
+            log.exception("process_pending: %s", e)
 
     log.info("Бот остановлен.")
     try:
