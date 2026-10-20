@@ -7,8 +7,10 @@ txt/fb2/fb2.zip создаются в тесте.
 
 Запуск: python3 -m unittest experiments/test_rag.py -v
 """
+import io
 import os
 import shutil
+import contextlib
 import zipfile
 import tempfile
 import unittest
@@ -308,8 +310,12 @@ class TestPromptAndAnswer(unittest.TestCase):
 class TestCli(KbCase):
     def test_main(self):
         self.put("s.txt", SOKRAT)
-        self.assertEqual(rag.main([self.books, "добродетель"]), 0)
-        self.assertEqual(rag.main([]), 2)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(rag.main([self.books, "добродетель"]), 0)
+            self.assertEqual(rag.main([]), 2)
+        self.assertIn("добродетель есть знание", out.getvalue())
+        self.assertIn('"chunks": 2', out.getvalue())
 
 
 if __name__ == "__main__":
