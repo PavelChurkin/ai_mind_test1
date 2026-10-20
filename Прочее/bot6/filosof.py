@@ -1,4 +1,4 @@
-# filosof.py — философские размышления для bot5 (перенесено из проекта ai_filosof)
+# filosof.py — философские размышления для bot5 и bot6 (перенесено из проекта ai_filosof)
 #
 # Источник: https://github.com/PavelChurkin/ai_filosof (filosof_bot.py, ThoughtGenerator,
 # коммит b48af94). Списки слов nouns.json, verbs.json, adject.json скопированы оттуда же
