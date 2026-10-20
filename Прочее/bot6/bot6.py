@@ -1,20 +1,22 @@
-# bot5.py — бот «Грань» для чата сообщества ВКонтакте (следующая версия bot4.py)
+# bot6.py — бот «Грань» для чата сообщества ВКонтакте (следующая версия bot5)
 #
-# Что добавлено по сравнению с bot4 (подробно — в README.md этой папки):
-#   * личные сообщения — только если разрешено (ALLOW_PRIVATE_MESSAGES, по умолчанию нет);
-#     в личке собеседнику доступны все команды админа;
-#   * /помощь — список команд с описаниями и правами;
-#   * /пауза — бот копит обращения и отвечает на них после паузы;
-#   * /лимит токенов, /лимит символов — настройки беседы (только админ);
-#   * пакетные ответы: бот ждёт BATCH_WAIT_SEC тишины и отвечает на все обращения разом;
-#   * контекст растёт в активном споре и возвращается к CONTEXT_SIZE после тишины;
-#     если история не влезает в лимит символов, старая часть сжимается в пересказ;
-#   * дневной лимит сообщений с оповещениями 25/50/90/100 % и /сбросить лимит сообщений;
-#   * /пересказ N от ЧЧ:ММ ДД.ММ.ГГГГ — пересказ с даты, с догрузкой истории из ВК;
-#   * /мысль, /мысль подробно — философские размышления (модуль filosof.py из ai_filosof);
-#   * пост в контекст попадает целиком (POST_MAX_CHARS убран).
+# Что добавлено по сравнению с bot5 (подробно — в README.md этой папки):
+#   * причина пустых ответов видна: «Не получилось…» приходит служебным сообщением с причиной
+#     (модель потратила лимит токенов на рассуждение, ошибка API…), при пустом ответе из-за
+#     лимита — один повтор с EMPTY_ANSWER_RETRY_TOKENS; одна строка лога на каждый запрос к LLM;
+#   * картинки: при ошибке сертификата — повтор с сертификатами certifi (и IMAGE_CA_FILE);
+#     ссылка на картинку больше не уходит прокси (он получал 429 от серверов ВК);
+#   * режим подробного лога (--debug) и запись лога в файл (--log-file);
+#   * серверный режим bot6_server.py: перезапуск раз в неделю с очисткой логов;
+#   * длинные обращения и /роль, которые ВК разбил на несколько сообщений, склеиваются;
+#   * база знаний (rag.py, папка RAG): «Грань, РАГ вопрос», «РАГ+» — ещё и ответ LLM после «---»;
+#   * «Грань, запомни» + пересланное — перезаписать RAG/Рефлексия.txt и переиндексировать;
+#   * роль по умолчанию — из файла Роль.txt рядом с ботом, /сбросить роль — вернуться к ней;
+#   * /лимит токенов понимает «3000», «: 3000», «30 000», «30к»; показывает, когда вернётся к
+#     стандарту, и сообщает в чат, когда вернулся.
 import os
 import re
+import ssl
 import sys
 import json
 import math
@@ -22,14 +24,20 @@ import time
 import base64
 import signal
 import sqlite3
+import argparse
+import functools
 import logging
+import logging.handlers
+import urllib.error
 import urllib.request
+from collections import OrderedDict
 from datetime import datetime, timedelta
 
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if BOT_DIR not in sys.path:
     sys.path.insert(0, BOT_DIR)
 import filosof  # noqa: E402  (лежит рядом с ботом)
+import rag      # noqa: E402
 
 # ============ НАСТРОЙКИ ============
 BOT_NAME = "Грань разумного"
@@ -56,11 +64,36 @@ CONTEXT_KEEP_SHARE = 0.6           # после сжатия свежая час
 MAX_TOKENS_DEFAULT = 800           # стандартный лимит выходных токенов (меняется /лимит токенов)
 MAX_TOKENS_CAP = 64000             # больше этого /лимит токенов не поставит
 TOKEN_LIMIT_RESET_MINUTES = 60     # через столько минут /лимит токенов сам вернётся к стандарту (0 — не вернётся)
+EMPTY_ANSWER_RETRY_TOKENS = 3000   # пустой ответ из-за лимита (всё ушло на рассуждение) — один повтор с таким лимитом (0 — без повтора)
+LLM_EXTRA_BODY = None              # доп. параметры запроса к модели, например {"thinking": {"type": "disabled"}}
 BATCH_WAIT_SEC = 8                 # ждём столько секунд без новых обращений и отвечаем на все разом
 BATCH_MAX_WAIT_SEC = 60            # но не дольше этого с первого обращения
 PAUSE_DEFAULT_MINUTES = 1          # /пауза без числа
 PAUSE_MAX_MINUTES = 60
 FRESHNESS_MINUTES = 10             # если обращение старше — не отвечаем
+
+# --- длинные сообщения, которые ВК разбил на части ---
+SPLIT_MIN_PART_CHARS = 3000        # часть такой длины (и длиннее) может продолжиться следующим сообщением
+SPLIT_JOIN_SEC = 10                # следующая часть приходит не позже стольких секунд (по дате сообщений)
+SPLIT_MAX_PARTS = 20               # больше частей в одно обращение не склеиваем
+ROLE_JOIN_SEC = 15                 # /роль без закрывающей скобки ждёт продолжения столько секунд
+
+# --- роль ---
+ROLE_FILE = "Роль.txt"             # роль по умолчанию — файл рядом с ботом (нет файла — DEFAULT_ROLE)
+
+# --- база знаний (RAG) ---
+RAG_DIR = os.path.join(BOT_DIR, "RAG")             # книги: txt, doc, docx, pdf, epub, fb2
+RAG_INDEX_PATH = os.path.join(BOT_DIR, "rag_index.db")
+RAG_TOP_K = 6                      # сколько найденных фрагментов передавать модели
+RAG_MIN_COVERAGE = 0.5             # фрагмент подходит, если в нём есть эта доля значимых слов запроса
+RAG_MAX_CONTEXT_CHARS = 8000       # сколько символов фрагментов передавать модели
+RAG_MAX_TOKENS = 1500              # лимит токенов ответа по базе знаний (берётся больший из этого и /лимит токенов)
+RAG_EMBEDDINGS = False             # True — ещё и векторный поиск (pip install sentence-transformers)
+RAG_EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
+RAG_NOTHING_FOUND = "В базе знаний ничего не нашлось."
+RAG_SEPARATOR = "---"              # РАГ+: ответ LLM идёт после этой строки
+REMEMBER_FILE = "Рефлексия.txt"    # «Грань, запомни» перезаписывает этот файл в RAG_DIR
+REMEMBER_ADMIN_ONLY = True         # «Грань, запомни» — только админ беседы (False — все)
 
 # --- дневной лимит ---
 DAILY_MESSAGE_LIMIT = 100          # ответов бота в сутки (0 — без лимита)
@@ -85,13 +118,24 @@ MAX_IMAGES_PER_REQUEST = 4         # картинок в одном запрос
 IMAGE_MODE = "base64"              # "base64" — скачать и передать данными, "url" — передать ссылку
 IMAGE_MAX_BYTES = 5 * 1024 * 1024
 IMAGE_MAX_SIDE = 1280              # предпочитаем размер фото не больше этой стороны
+IMAGE_DOWNLOAD_TIMEOUT = 15
+IMAGE_CA_FILE = None               # доп. корневой сертификат (.pem/.crt) для скачивания картинок, путь от папки бота
+IMAGE_SSL_INSECURE_FALLBACK = False  # True — если сертификат не проверился, скачать без проверки (небезопасно)
+IMAGE_URL_FALLBACK = False         # True — не скачалась картинка в base64-режиме — передать модели ссылку (как bot5)
+IMAGE_CACHE_SIZE = 16              # столько последних скачанных картинок держать в памяти
 
 LLM_MIN_INTERVAL_SEC = 3           # не чаще одного запроса к LLM за столько секунд
 VK_MESSAGE_LIMIT = 4000            # ВК режет сообщения длиннее 4096 символов
 LONGPOLL_WAIT_SEC = 1              # Long Poll возвращается не реже — чтобы вовремя отвечать пакетам
 
-DB_PATH = "gran5.db"
-OLD_DB_PATH = "gran4.db"           # БД bot4: из неё переносятся сообщения, роли и имена
+DB_PATH = os.path.join(BOT_DIR, "gran6.db")
+OLD_DB_NAME = "gran5.db"           # БД bot5: ищется рядом с ботом, в текущей папке и в ../bot5
+OLD_DB_PATH = None                 # явный путь к БД bot5 (если задан — ищется только он)
+
+# --- лог и перезапуск ---
+LOG_MAX_MB = 50                    # файл лога (--log-file) больше этого — ротация
+LOG_BACKUPS = 1                    # сколько старых файлов лога хранить
+RESTART_EXIT_CODE = 75             # с этим кодом бот выходит для планового перезапуска (--restart-after-hours)
 
 PROXYAPI_BASE_URL = "https://api.proxyapi.ru/v1"
 MODEL_NAME = "deepseek/deepseek-v4-flash-vision-exp"
@@ -100,8 +144,8 @@ MODEL_NAME = "deepseek/deepseek-v4-flash-vision-exp"
 CHAT_PEER_OFFSET = 2000000000      # peer_id бесед начинается с 2e9
 SYSTEM_MARK = "⚙️"                 # служебные сообщения бота; в контекст LLM не попадают
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gran")
+DEBUG_MODE = False                 # --debug: подробный лог основных функций (setup_logging)
 
 DEFAULT_ROLE = (
     "Ты — Грань, участник беседы. Общайся живо, по-человечески, "
@@ -110,6 +154,8 @@ DEFAULT_ROLE = (
 LIMIT_REACHED_TEXT = "Извините, сегодня лимит сообщений достигнут."
 
 STOP_REQUESTED = False
+EXIT_CODE = 0
+LAST_LLM_ERROR = ""                # почему последний запрос к LLM не дал ответа (для сообщения в чат)
 
 # Заполняются в init() — так модуль можно импортировать в тестах без токенов и сети.
 DB = None
@@ -119,14 +165,84 @@ BOT_GROUP_ID = 0                   # отрицательный id сообще�
 VK_USER_TOKEN = None               # необязательный ключ пользователя/сервисный — для wall.getById
 ADMIN_IDS = set()
 _last_llm_call = 0.0
+_last_limit_check = 0.0
 _admin_cache = {}                  # peer_id -> (когда загружен, {id админов})
 PEERS = {}                         # peer_id -> PeerState: очередь обращений, пауза, размер контекста
 FILOSOF = filosof.ThoughtGenerator()
+KB = None                          # база знаний rag.KnowledgeBase (get_kb)
+_image_cache = OrderedDict()       # url -> часть запроса с картинкой
+_ssl_contexts = None
+_role_file_cache = (None, None)    # (mtime, текст) файла роли
 
 
 def now():
     """Текущее время; тесты подменяют эту функцию."""
     return time.time()
+
+
+# ============ Лог ============
+NOISY_LOGGERS = ("httpx", "httpx2", "httpcore", "openai", "urllib3", "pymorphy3")
+
+
+def setup_logging(debug=False, log_file=None, console=True):
+    """Обычный режим — INFO без строк HTTP-библиотек; debug — подробный лог основных функций
+    (вход, выход, время, промпты и ответы модели). log_file — ещё и в файл (с ротацией)."""
+    global DEBUG_MODE
+    DEBUG_MODE = bool(debug)
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+        h.close()
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(funcName)s: %(message)s" if debug
+                            else "%(asctime)s %(levelname)s %(message)s")
+    handlers = []
+    if console:
+        stream = sys.stderr
+        try:   # консоль Windows (cp866/cp1251) не умеет эмодзи — не падаем на них
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+        handlers.append(logging.StreamHandler(stream))
+    if log_file:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        handlers.append(logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=LOG_MAX_MB * 1024 * 1024, backupCount=LOG_BACKUPS, encoding="utf-8"))
+    for h in handlers:
+        h.setFormatter(fmt)
+        root.addHandler(h)
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    if debug:
+        logging.getLogger("httpx").setLevel(logging.INFO)     # строка на каждый HTTP-запрос
+        logging.getLogger("httpx2").setLevel(logging.INFO)
+
+
+def brief(value, limit=200):
+    """Короткое представление значения для подробного лога."""
+    if isinstance(value, dict) and "peer_id" in value:      # сообщение ВК
+        value = {k: value.get(k) for k in ("peer_id", "from_id", "conversation_message_id", "text")}
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + f"…(+{len(text) - limit})"
+
+
+def traced(fn):
+    """В режиме --debug пишет в лог вход в функцию (аргументы), выход (результат) и время."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not DEBUG_MODE:
+            return fn(*args, **kwargs)
+        shown = ", ".join([brief(a, 120) for a in args] + [f"{k}={brief(v, 120)}" for k, v in kwargs.items()])
+        log.debug(">> %s(%s)", fn.__name__, shown)
+        t0 = time.time()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as e:
+            log.debug("<< %s: исключение %r за %.2f с", fn.__name__, e, time.time() - t0)
+            raise
+        log.debug("<< %s = %s за %.2f с", fn.__name__, brief(result), time.time() - t0)
+        return result
+    return wrapper
 
 
 # ============ БД ============
@@ -238,9 +354,51 @@ def db_get_range(peer_id, start_ts, limit, exclude_ids=()):
     return _rows(rows)
 
 
+def role_file_path():
+    return ROLE_FILE if os.path.isabs(ROLE_FILE) else os.path.join(BOT_DIR, ROLE_FILE)
+
+
+def read_text_file(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    for enc in ("utf-8-sig", "cp1251"):     # Блокнот Windows может сохранить в ANSI
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def default_role():
+    """Роль по умолчанию: текст файла Роль.txt рядом с ботом (перечитывается, если файл
+    изменился), а если файла нет или он пуст — DEFAULT_ROLE."""
+    global _role_file_cache
+    path = role_file_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return DEFAULT_ROLE
+    if _role_file_cache[0] != (path, mtime):
+        try:
+            text = read_text_file(path).strip()
+        except OSError as e:
+            log.warning("%s: %s", path, e)
+            text = ""
+        _role_file_cache = ((path, mtime), text)
+        log.info("Роль по умолчанию: %s (%d символов)", path, len(text))
+    return _role_file_cache[1] or DEFAULT_ROLE
+
+
 def db_get_role(peer_id):
     r = DB.execute("SELECT role FROM roles WHERE peer_id=?", (peer_id,)).fetchone()
-    return r[0] if r else DEFAULT_ROLE
+    return r[0] if r else default_role()
+
+
+def db_del_role(peer_id):
+    """Удаляет роль беседы: дальше действует роль по умолчанию (Роль.txt)."""
+    deleted = DB.execute("DELETE FROM roles WHERE peer_id=?", (peer_id,)).rowcount
+    DB.commit()
+    return bool(deleted)
 
 
 def db_set_role(peer_id, role):
@@ -288,10 +446,24 @@ def db_upsert_user(user_id, first_name, last_name=""):
     DB.commit()
 
 
-def migrate_from_bot4(old_path=OLD_DB_PATH):
-    """Переносит из БД bot4 сообщения, роли, имена и метки /забудь: схема та же,
-    история в bot4 уже полная, загружать её из ВК заново не нужно."""
-    if db_state_get("migrated_bot4") == "1" or not os.path.exists(old_path):
+def find_old_db():
+    """БД bot5: OLD_DB_PATH, иначе gran5.db рядом с ботом, в текущей папке или в ../bot5."""
+    if OLD_DB_PATH:
+        return OLD_DB_PATH if os.path.exists(OLD_DB_PATH) else None
+    for folder in (BOT_DIR, os.getcwd(), os.path.join(BOT_DIR, "..", "bot5")):
+        path = os.path.join(folder, OLD_DB_NAME)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def migrate_from_bot5(old_path=None):
+    """Переносит из БД bot5 сообщения, роли, имена и настройки бесед (/забудь, /лимит символов,
+    начало истории чата): схема та же, загружать историю из ВК заново не нужно."""
+    if db_state_get("migrated_bot5") == "1":
+        return
+    old_path = old_path or find_old_db()
+    if not old_path:
         return
     try:
         old = sqlite3.connect(old_path)
@@ -305,16 +477,18 @@ def migrate_from_bot4(old_path=OLD_DB_PATH):
             DB.execute("INSERT OR IGNORE INTO roles(peer_id, role) VALUES(?,?)", (peer_id, role))
         for row in old.execute("SELECT user_id, first_name, last_name, updated_at FROM users"):
             DB.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)", row)
-        for key, value in old.execute("SELECT key, value FROM state WHERE key LIKE 'forget_%'"):
+        for key, value in old.execute(
+                "SELECT key, value FROM state WHERE key LIKE 'forget_%' OR key LIKE 'chars_%' "
+                "OR key LIKE 'history_complete_%'"):
             DB.execute("INSERT OR IGNORE INTO state(key, value) VALUES(?,?)", (key, value))
         old.close()
         DB.commit()
         if n:
             db_state_set("initial_load_done", "1")
-        db_state_set("migrated_bot4", "1")
-        log.info("Из %s перенесено %d сообщений, роли и имена", old_path, n)
+        db_state_set("migrated_bot5", "1")
+        log.info("Из %s перенесено %d сообщений, роли, имена и настройки бесед", old_path, n)
     except Exception as e:
-        log.warning("migrate_from_bot4: %s", e)
+        log.warning("migrate_from_bot5 (%s): %s", old_path, e)
 
 
 # ============ Имена ============
@@ -601,6 +775,7 @@ def send_system(peer_id, text, reply_to_msg=None):
 
 
 # ============ Загрузка истории ============
+@traced
 def fetch_history(peer_id, count, offset=0, stop_before_ts=None):
     """
     Загружает из ВК до `count` сообщений диалога (от новых к старым, начиная с offset)
@@ -699,14 +874,57 @@ def _limit_get(key, default):
     return int(value), int(set_ts)
 
 
+def tokens_reset_at(peer_id):
+    """Когда /лимит токенов беседы вернётся к стандарту (timestamp) или None."""
+    _value, set_ts = _limit_get(f"tokens_{peer_id}", MAX_TOKENS_DEFAULT)
+    if not set_ts or not TOKEN_LIMIT_RESET_MINUTES:
+        return None
+    return set_ts + TOKEN_LIMIT_RESET_MINUTES * 60
+
+
 def tokens_limit(peer_id):
-    """Лимит выходных токенов беседы; через TOKEN_LIMIT_RESET_MINUTES — снова стандарт."""
+    """Лимит выходных токенов беседы; через TOKEN_LIMIT_RESET_MINUTES — снова стандарт
+    (и об этом — служебное сообщение в чат, чтобы возврат не был незаметным)."""
     value, set_ts = _limit_get(f"tokens_{peer_id}", MAX_TOKENS_DEFAULT)
-    if set_ts and TOKEN_LIMIT_RESET_MINUTES and now() - set_ts >= TOKEN_LIMIT_RESET_MINUTES * 60:
+    reset_at = tokens_reset_at(peer_id)
+    if reset_at and now() >= reset_at:
         db_state_del(f"tokens_{peer_id}")
-        log.info("peer=%s: лимит токенов вернулся к стандарту %d", peer_id, MAX_TOKENS_DEFAULT)
+        log.info("peer=%s: лимит токенов %d (задан %s) вернулся к стандарту %d", peer_id, value,
+                 fmt_ts(set_ts), MAX_TOKENS_DEFAULT)
+        try:
+            send_system(peer_id, f"Прошло {TOKEN_LIMIT_RESET_MINUTES} мин с «/лимит токенов {value}» "
+                                 f"(задан в {datetime.fromtimestamp(set_ts):%H:%M}) — лимит токенов "
+                                 f"вернулся к стандарту {MAX_TOKENS_DEFAULT}.")
+        except Exception as e:
+            log.warning("сообщение о возврате лимита: %s", e)
         return MAX_TOKENS_DEFAULT
     return value
+
+
+def check_token_limits(t=None):
+    """Возвращает к стандарту истёкшие лимиты токенов всех бесед (сообщение — вовремя,
+    а не при следующем обращении). Вызывается из process_pending не чаще раза в 30 с."""
+    global _last_limit_check
+    t = now() if t is None else t
+    if t - _last_limit_check < 30:
+        return
+    _last_limit_check = t
+    for (key,) in DB.execute("SELECT key FROM state WHERE key LIKE 'tokens_%'").fetchall():
+        try:
+            tokens_limit(int(key[len("tokens_"):]))
+        except ValueError:
+            continue
+
+
+def parse_limit_value(arg):
+    """Число из «/лимит токенов 3000», «: 3000», «30 000», «30к», «2k», «3 тыс». None — не число."""
+    if arg is None:
+        return None
+    m = re.fullmatch(r"(\d(?:[\d\s]*\d)?)\s*(к|k|тыс\.?)?", arg.strip().lower())
+    if not m:
+        return None
+    value = int(re.sub(r"\s", "", m.group(1)))
+    return value * 1000 if m.group(2) else value
 
 
 def chars_limit(peer_id):
@@ -776,6 +994,8 @@ class PeerState:
         self.last_activity = 0.0       # время последнего сообщения людей
         self.last_answer_ts = 0.0
         self.last_interval = None      # время между двумя последними ответами бота
+        self.chains = {}               # from_id -> [часть]: длинные сообщения без обращения подряд
+        self.buffers = {}              # from_id -> {...}: /роль или «запомни», ждущие продолжения
 
 
 def peer_state(peer_id):
@@ -837,6 +1057,32 @@ class Request:
         self.text = text
         self.images = list(images)
         self.command = command         # (имя, аргумент) — для команд, отложенных паузой
+        self.rowids = [rowid] if rowid else []
+        self.parts = 1                 # из скольких сообщений ВК собрано (длинное разрезано)
+        self.last_part_ts = self.ts
+        self.last_part_len = len(message.get("text") or "")
+        self.note = ""                 # пояснение к ответу на команду
+
+    def add_part(self, part):
+        """Следующая часть длинного сообщения, которое ВК разрезал на несколько."""
+        if part["rowid"]:
+            self.rowids.append(part["rowid"])
+        self.text = f"{self.text}\n{part['text']}" if self.text else part["text"]
+        self.images.extend(part["images"])
+        self.parts += 1
+        self.last_part_ts, self.last_part_len = part["ts"], part["len"]
+
+    def prepend(self, parts):
+        """Предыдущие части: обращение («Грань, …») оказалось в последней части."""
+        self.rowids = [p["rowid"] for p in parts if p["rowid"]] + self.rowids
+        self.text = "\n".join([p["text"] for p in parts] + [self.text])
+        self.images = [u for p in parts for u in p["images"]] + self.images
+        self.parts += len(parts)
+        self.ts = parts[0]["ts"]
+
+    def __repr__(self):
+        return (f"Request(peer={self.peer_id}, from={self.from_id}, parts={self.parts}, "
+                f"cmd={self.command!r}, text={shorten(self.text, 60)!r})")
 
 
 def enqueue(req):
@@ -855,17 +1101,137 @@ def process_pending(t=None):
     главного цикла после каждой проверки Long Poll.
     """
     t = now() if t is None else t
+    if DB is not None:
+        check_token_limits(t)
     for peer_id, st in list(PEERS.items()):
+        for from_id, buf in list(st.buffers.items()):
+            if t - buf["t"] >= ROLE_JOIN_SEC:
+                finish_buffer(peer_id, from_id)       # продолжение так и не пришло
+        for from_id, chain in list(st.chains.items()):
+            if t - chain[-1]["added"] > SPLIT_JOIN_SEC * 3:
+                del st.chains[from_id]
         if st.paused_until > t:
             continue
         resumed = bool(st.paused_until)     # пауза только что кончилась — отвечаем сразу
         st.paused_until = 0.0
+        wait = BATCH_WAIT_SEC
+        if any(r.last_part_len >= SPLIT_MIN_PART_CHARS and not r.command for r in st.pending):
+            wait = max(wait, SPLIT_JOIN_SEC)  # длинная часть — может прийти продолжение
         if st.pending and (resumed
-                           or t - st.last_pending_ts >= BATCH_WAIT_SEC
+                           or t - st.last_pending_ts >= wait
                            or t - st.first_pending_ts >= BATCH_MAX_WAIT_SEC):
             flush(peer_id)
 
 
+def is_idle():
+    """Нет ожидающих ответа обращений, недописанных команд и пауз — можно перезапускаться."""
+    t = now()
+    return all(not st.pending and not st.buffers and st.paused_until <= t for st in PEERS.values())
+
+
+# ---- длинные сообщения, которые ВК разрезал на части ----
+def find_continuation(st, from_id, ts):
+    """Ожидающее ответа обращение того же автора, продолжением которого может быть сообщение
+    с датой ts: прошлая часть длинная (≥ SPLIT_MIN_PART_CHARS) и пришла не раньше SPLIT_JOIN_SEC."""
+    for req in reversed(st.pending):
+        if req.from_id != from_id or req.command:
+            continue
+        if (req.last_part_len >= SPLIT_MIN_PART_CHARS and 0 <= ts - req.last_part_ts <= SPLIT_JOIN_SEC
+                and req.parts < SPLIT_MAX_PARTS):
+            return req
+        return None
+    return None
+
+
+def chain_continues(chain, ts):
+    return (chain and chain[-1]["len"] >= SPLIT_MIN_PART_CHARS
+            and 0 <= ts - chain[-1]["ts"] <= SPLIT_JOIN_SEC and len(chain) < SPLIT_MAX_PARTS)
+
+
+def note_unaddressed_part(st, from_id, part):
+    """Длинное сообщение без обращения может оказаться началом обращения, у которого «Грань»
+    в последней части: запоминаем цепочку таких сообщений."""
+    chain = st.chains.get(from_id)
+    if chain_continues(chain, part["ts"]):
+        if part["len"] >= SPLIT_MIN_PART_CHARS:
+            chain.append(part)
+        else:
+            del st.chains[from_id]            # сообщение кончилось без обращения к боту
+    elif part["len"] >= SPLIT_MIN_PART_CHARS:
+        st.chains[from_id] = [part]
+    else:
+        st.chains.pop(from_id, None)
+
+
+def take_chain(st, from_id, ts):
+    chain = st.chains.pop(from_id, None)
+    return chain if chain_continues(chain, ts) else None
+
+
+def buffer_may_continue(cmd, text, message):
+    """/роль или «запомни» с текстом, у которого, похоже, есть продолжение в следующих сообщениях."""
+    if cmd[0] == "роль":
+        role = extract_role(text)
+        return bool(role) and (role[1] is False or (role[1] is None and len(text) >= SPLIT_MIN_PART_CHARS))
+    if cmd[0] == "запомни":
+        return (not message.get("fwd_messages") and not message.get("reply_message")
+                and len(text) >= SPLIT_MIN_PART_CHARS)
+    return False
+
+
+def start_buffer(st, req, text):
+    st.buffers[req.from_id] = {"req": req, "text": text, "t": now(), "ts": req.ts,
+                               "len": len(text), "parts": 1}
+    log.info("peer=%s: команда %s от %s ждёт продолжения (%d символов)", req.peer_id,
+             req.command[0], req.from_id, len(text))
+
+
+def continue_buffer(peer_id, from_id, buf, text, part):
+    """Добавляет часть к недописанной команде. True — сообщение поглощено."""
+    if not 0 <= part["ts"] - buf["ts"] <= SPLIT_JOIN_SEC:
+        finish_buffer(peer_id, from_id)
+        return False
+    req = buf["req"]
+    buf["text"] += "\n" + text
+    buf.update(t=now(), ts=part["ts"], len=part["len"], parts=buf["parts"] + 1)
+    if part["rowid"]:
+        req.rowids.append(part["rowid"])
+    if req.command[0] == "роль":
+        closed = extract_role(buf["text"])[1]
+        done = closed is True or (closed is None and part["len"] < SPLIT_MIN_PART_CHARS)
+    else:
+        done = part["len"] < SPLIT_MIN_PART_CHARS
+    log.info("peer=%s: часть %d команды %s (%d символов)%s", peer_id, buf["parts"],
+             req.command[0], part["len"], " — команда собрана" if done else "")
+    if done or buf["parts"] >= SPLIT_MAX_PARTS:
+        finish_buffer(peer_id, from_id)
+    return True
+
+
+@traced
+def finish_buffer(peer_id, from_id):
+    """Выполняет /роль или «запомни», собранную из нескольких сообщений."""
+    buf = peer_state(peer_id).buffers.pop(from_id, None)
+    if not buf:
+        return
+    req, text = buf["req"], buf["text"]
+    if req.command[0] == "роль":
+        role, closed = extract_role(text)
+        req.command = ("роль", role or None)
+        if buf["parts"] > 1:
+            req.note += f" Роль собрана из {buf['parts']} сообщений ({len(role)} символов)."
+        if closed is False:
+            req.note += " Закрывающая скобка так и не пришла — роль взята целиком до конца сообщения."
+    else:
+        m = REMEMBER_RE.search(text)
+        req.command = ("запомни", text[m.end():].strip() if m else text)
+    try:
+        run_command(req)
+    except Exception as e:
+        log.exception("команда %s: %s", req.command[0], e)
+
+
+@traced
 def flush(peer_id):
     st = peer_state(peer_id)
     items, st.pending = st.pending, []
@@ -941,6 +1307,7 @@ def compress_lines(previous_summary, lines):
     return shorten(summary, CONTEXT_SUMMARY_CHARS)
 
 
+@traced
 def build_history(peer_id, rows, max_chars):
     """
     История для запроса. Влезает в max_chars — как есть. Не влезает (в активном споре
@@ -987,18 +1354,82 @@ def summary_block(summary, lines):
     return f"(Пересказ более ранней части беседы: {summary})\n{body}".rstrip()
 
 
-def _image_part(url):
-    if IMAGE_MODE == "base64":
+def ssl_contexts():
+    """Контексты SSL для скачивания картинок, по очереди: системные корневые сертификаты,
+    затем certifi (в нём есть HARICA — корень сертификатов *.userapi.com, которого может
+    не быть в хранилище Windows), затем IMAGE_CA_FILE, и (если разрешено) без проверки."""
+    global _ssl_contexts
+    if _ssl_contexts is None:
+        contexts = [("системные сертификаты", ssl.create_default_context())]
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as r:
+            import certifi
+            contexts.append(("certifi", ssl.create_default_context(cafile=certifi.where())))
+        except Exception as e:      # certifi ставится вместе с httpx/openai, но мало ли
+            log.debug("certifi недоступен: %s", e)
+        if IMAGE_CA_FILE:
+            path = IMAGE_CA_FILE if os.path.isabs(IMAGE_CA_FILE) else os.path.join(BOT_DIR, IMAGE_CA_FILE)
+            try:
+                contexts.append((path, ssl.create_default_context(cafile=path)))
+            except Exception as e:
+                log.warning("IMAGE_CA_FILE %s: %s", path, e)
+        if IMAGE_SSL_INSECURE_FALLBACK:
+            contexts.append(("без проверки сертификата", ssl._create_unverified_context()))
+        _ssl_contexts = contexts
+    return _ssl_contexts
+
+
+def is_cert_error(e):
+    return isinstance(e, ssl.SSLCertVerificationError) or (
+        isinstance(e, urllib.error.URLError) and isinstance(e.reason, ssl.SSLCertVerificationError))
+
+
+def download_image(url):
+    """Скачивает картинку: (данные, mime). При ошибке сертификата пробует следующий
+    контекст SSL. Исключение — если скачать не удалось."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    contexts = ssl_contexts() if url.lower().startswith("https:") else [("http", None)]
+    for i, (name, ctx) in enumerate(contexts):
+        try:
+            with urllib.request.urlopen(req, timeout=IMAGE_DOWNLOAD_TIMEOUT, context=ctx) as r:
                 data = r.read(IMAGE_MAX_BYTES + 1)
                 mime = r.headers.get_content_type() or "image/jpeg"
-            if len(data) <= IMAGE_MAX_BYTES:
-                url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
         except Exception as e:
+            if is_cert_error(e) and i + 1 < len(contexts):
+                log.info("картинка: сертификат не проверился (%s), пробую: %s",
+                         getattr(e, "reason", e), contexts[i + 1][0])
+                continue
+            raise
+        if i:
+            log.debug("картинка скачана, сертификаты: %s", name)
+        if len(data) > IMAGE_MAX_BYTES:
+            raise ValueError(f"картинка больше {IMAGE_MAX_BYTES} байт")
+        return data, mime
+    raise RuntimeError("нет контекста SSL")
+
+
+@traced
+def _image_part(url):
+    """Часть запроса с картинкой или None, если картинку не удалось скачать.
+    Ссылку модели передаём только при IMAGE_MODE = "url" или IMAGE_URL_FALLBACK: сервер
+    прокси, скачивая картинку с серверов ВК, получал 429 и весь запрос падал с 400."""
+    if IMAGE_MODE != "base64":
+        return {"type": "image_url", "image_url": {"url": url}}
+    if url in _image_cache:
+        _image_cache.move_to_end(url)
+        return _image_cache[url]
+    try:
+        data, mime = download_image(url)
+    except Exception as e:
+        if IMAGE_URL_FALLBACK:
             log.warning("скачивание картинки: %s — передаю ссылкой", e)
-    return {"type": "image_url", "image_url": {"url": url}}
+            return {"type": "image_url", "image_url": {"url": url}}
+        log.warning("скачивание картинки: %s — картинка пропущена", e)
+        return None
+    part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}}
+    _image_cache[url] = part
+    while len(_image_cache) > IMAGE_CACHE_SIZE:
+        _image_cache.popitem(last=False)
+    return part
 
 
 def _rate_limit():
@@ -1010,29 +1441,87 @@ def _rate_limit():
     _last_llm_call = time.time()
 
 
+def _llm_request(system, content, max_tokens):
+    """Один запрос к API: (ответ, finish_reason). Пишет в лог строку с расходом токенов."""
+    _rate_limit()
+    kwargs = {"extra_body": LLM_EXTRA_BODY} if LLM_EXTRA_BODY else {}
+    t0 = time.time()
+    resp = llm_client.chat.completions.create(
+        model=MODEL_NAME,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+        **kwargs,
+    )
+    choice = resp.choices[0]
+    answer = (getattr(choice.message, "content", None) or "").strip()
+    finish = getattr(choice, "finish_reason", None)
+    usage = getattr(resp, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning = getattr(details, "reasoning_tokens", None)
+    log.info("LLM: %.1f с, finish=%s, токены: вход %s, выход %s%s (лимит %d), ответ %d символов",
+             time.time() - t0, finish, getattr(usage, "prompt_tokens", "?"),
+             getattr(usage, "completion_tokens", "?"),
+             f", из них рассуждение {reasoning}" if reasoning else "", max_tokens, len(answer))
+    if DEBUG_MODE:
+        log.debug("LLM system:\n%s\nLLM user:\n%s\nLLM ответ:\n%s", system,
+                  content if isinstance(content, str) else content[0]["text"], answer)
+    return answer, finish
+
+
+@traced
 def llm_call(system, user_text, max_tokens=MAX_TOKENS_DEFAULT, images=()):
+    """
+    Запрос к LLM. Возвращает ответ или "" — тогда причина в LAST_LLM_ERROR.
+    Пустой ответ с finish_reason="length" — модель-«рассуждалка» потратила весь лимит
+    токенов на рассуждение (токены списаны, а текста нет): один повтор с большим лимитом.
+    Ошибка API с картинками — повтор без картинок.
+    """
+    global LAST_LLM_ERROR
+    LAST_LLM_ERROR = ""
     images = list(dict.fromkeys(images))[:MAX_IMAGES_PER_REQUEST]
     content = user_text
     if images:
-        content = [{"type": "text", "text": user_text}] + [_image_part(u) for u in images]
-    _rate_limit()
+        loaded = [(u, p) for u, p in ((u, _image_part(u)) for u in images) if p]
+        if len(loaded) < len(images):
+            user_text += f"\n\n({len(images) - len(loaded)} картинок не удалось скачать.)"
+        images = [u for u, _ in loaded]     # для повторов — только скачавшиеся (они в кэше)
+        if loaded:
+            content = [{"type": "text", "text": user_text}] + [p for _, p in loaded]
+        else:
+            content = user_text
     try:
-        resp = llm_client.chat.completions.create(
-            model=MODEL_NAME,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": content},
-            ],
-        )
-        return (resp.choices[0].message.content or "").strip()
+        answer, finish = _llm_request(system, content, max_tokens)
     except Exception as e:
         log.error("llm_call: %s", e)
+        LAST_LLM_ERROR = f"ошибка API: {shorten(str(e), 300)}"
         if images:
             # модель или прокси не приняли картинки — пробуем хотя бы текстом
-            return llm_call(system, user_text + "\n\n(Картинки не удалось передать.)",
-                            max_tokens)
+            answer = llm_call(system, user_text + "\n\n(Картинки не удалось передать.)", max_tokens)
+            if not answer:
+                LAST_LLM_ERROR = f"ошибка API: {shorten(str(e), 300)}; без картинок: {LAST_LLM_ERROR}"
+            return answer
         return ""
+    if answer:
+        if finish == "length":
+            log.warning("ответ обрезан лимитом %d токенов", max_tokens)
+        return answer
+    if finish == "length":
+        LAST_LLM_ERROR = (f"модель израсходовала весь лимит ({max_tokens} токенов) на рассуждение "
+                          "и не успела написать ответ")
+        if EMPTY_ANSWER_RETRY_TOKENS and max_tokens < EMPTY_ANSWER_RETRY_TOKENS:
+            log.warning("пустой ответ: %s — повтор с лимитом %d", LAST_LLM_ERROR, EMPTY_ANSWER_RETRY_TOKENS)
+            answer = llm_call(system, user_text, EMPTY_ANSWER_RETRY_TOKENS, images)
+            if not answer and LAST_LLM_ERROR.startswith("модель израсходовала"):
+                LAST_LLM_ERROR = (f"модель израсходовала весь лимит на рассуждение даже при "
+                                  f"{EMPTY_ANSWER_RETRY_TOKENS} токенах")
+            return answer
+    else:
+        LAST_LLM_ERROR = f"модель вернула пустой ответ (finish_reason={finish})"
+    log.warning("пустой ответ: %s", LAST_LLM_ERROR)
+    return ""
 
 
 def clean_answer(text):
@@ -1040,6 +1529,7 @@ def clean_answer(text):
     return re.sub(rf"^\s*(\[[^\]]*\]\s*)?({re.escape(BOT_NAME)}|Грань)\s*:\s*", "", text or "").strip()
 
 
+@traced
 def ask_gran(peer_id, requests, context_rows, images=()):
     """Один запрос к LLM на одно или несколько обращений, накопившихся за BATCH_WAIT_SEC."""
     system = build_system_prompt(db_get_role(peer_id))
@@ -1064,6 +1554,7 @@ def ask_gran(peer_id, requests, context_rows, images=()):
     return clean_answer(llm_call(system, prompt, max_tokens=tokens_limit(peer_id), images=images))
 
 
+@traced
 def summarize_rows(peer_id, rows):
     system = build_system_prompt(db_get_role(peer_id))
     ctx = format_context(rows, max_chars=SUMMARY_MAX_INPUT * 200)
@@ -1075,6 +1566,7 @@ def summarize_rows(peer_id, rows):
     return llm_call(system, prompt, max_tokens=max(SUMMARY_MAX_TOKENS, tokens_limit(peer_id)))
 
 
+@traced
 def summarize_text(peer_id, text, images=()):
     system = "Ты — полезный помощник, который делает краткое резюме текста."
     prompt = f"Перескажи суть следующего текста кратко и по делу:\n\n{text}"
@@ -1102,9 +1594,32 @@ def should_respond(message_ts):
     return (int(now()) - message_ts) <= FRESHNESS_MINUTES * 60
 
 
+ROLE_RE = re.compile(r"/роль(?!\w)", re.IGNORECASE)
+ADDRESS_PREFIX_RE = re.compile(r"\s*(?:грань\b[\s,.:!—-]*)?", re.IGNORECASE)
+
+
 def extract_role(text):
-    m = re.search(r"/роль\s*\(([^)]*)\)", text, re.IGNORECASE | re.DOTALL)
-    return m.group(1).strip() if m else None
+    """
+    Роль из «/роль (текст)» или «/роль текст»: (текст, закрыта) или None.
+    закрыта: True — скобка закрыта; False — «(» без «)» (ВК разрезал длинную роль на
+    несколько сообщений, продолжение — в следующих); None — форма без скобок (она только
+    в начале сообщения, можно после «Грань,»). «/роль» без текста — ("", None).
+    Скобки внутри роли допустимы: роль кончается последней «)», если она закрывает «(».
+    """
+    text = text or ""
+    m = ROLE_RE.search(text)
+    if not m:
+        return None
+    rest = text[m.end():].lstrip()
+    if rest.startswith("("):
+        body = rest[1:]
+        closed = body.rstrip().endswith(")") or body.count(")") > body.count("(")
+        if closed:
+            body = body[:body.rindex(")")]
+        return body.strip(), closed
+    if not ADDRESS_PREFIX_RE.fullmatch(text[:m.start()]):
+        return None
+    return rest.strip(), None
 
 
 def is_summary_request(text):
@@ -1146,7 +1661,12 @@ def parse_start_time(s, t=None):
     return int(dt.timestamp())
 
 
-_LIMIT_ARG = r"(?:\s+(\d+|сброс|стандарт))?"
+SPLIT_COMMANDS = {"роль", "запомни"}    # их текст может прийти несколькими сообщениями
+RESET_ROLE_RE = re.compile(r"(?:^|\s)/сбросить\s+роль\b", re.IGNORECASE)
+REMEMBER_RE = re.compile(r"\bгрань\b[\s,.:!—-]*запомни\b|(?:^|\s)/запомни\b", re.IGNORECASE)
+RAG_RE = re.compile(r"(?<![\w/])(/?)(раг|rag)(\+?)(?!\w)", re.IGNORECASE)
+_NUMBER = r"\d(?:[\d \u00a0\u2009\u202f]*\d)?(?:\s*(?:к|k|тыс\.?))?(?!\w)"   # 3000, 30 000, 30к, 2k, 3 тыс
+_LIMIT_ARG = r"(?:\s*[:=]?\s*(" + _NUMBER + r"|сброс|стандарт))?"
 COMMAND_PATTERNS = [
     ("помощь", re.compile(r"(?:^|\s)/помощь\b", re.IGNORECASE)),
     ("пауза", re.compile(r"(?:^|\s)/пауза\b(?:\s+(\d+))?", re.IGNORECASE)),
@@ -1160,14 +1680,36 @@ COMMAND_PATTERNS = [
 ]
 
 
-def parse_command(text):
-    """(имя, аргумент) первой найденной команды или None."""
+def parse_rag(text, addressed=True):
+    """«Грань, РАГ вопрос» / «/раг вопрос» / «РАГ+ …» → (плюс, вопрос) или None.
+    Без «/» слово должно быть написано заглавными («РАГ») или стоять сразу после «Грань,»,
+    и сообщение должно быть обращением к боту — чтобы не срабатывать на случайное «раг»."""
+    for m in RAG_RE.finditer(text):
+        slash, word = m.group(1), m.group(2)
+        after_name = bool(ADDRESS_PREFIX_RE.fullmatch(text[:m.start()])) and has_trigger(text[:m.start()])
+        if slash or ((word.isupper() or after_name) and addressed):
+            query = re.sub(r"^[\s,.:;!?—-]+", "", text[m.end():]).strip()
+            return bool(m.group(3)), query
+    return None
+
+
+def parse_command(text, addressed=True):
+    """(имя, аргумент) первой найденной команды или None.
+    addressed — сообщение обращено к боту (нужно для «РАГ» без косой черты)."""
     text = text or ""
     if is_stop_request(text):
         return ("стоп", None)
+    if RESET_ROLE_RE.search(text):
+        return ("сбросить роль", None)
     role = extract_role(text)
-    if role:
-        return ("роль", role)
+    if role is not None:
+        return ("роль", role[0] or None)    # None — показать текущую роль
+    m = REMEMBER_RE.search(text)
+    if m:
+        return ("запомни", text[m.end():].strip())
+    rag_cmd = parse_rag(text, addressed)
+    if rag_cmd:
+        return ("раг", rag_cmd)
     for name, rx in COMMAND_PATTERNS:
         m = rx.search(text)
         if not m:
@@ -1214,7 +1756,16 @@ HELP = [
      f"не отвечать {PAUSE_DEFAULT_MINUTES} мин (до {PAUSE_MAX_MINUTES}), потом ответить на всё "
      "накопившееся; «/пауза 0» — снять паузу"),
     ("забудь", "/забудь", "все", "начать контекст беседы с чистого листа (история в БД остаётся)"),
-    ("роль", "/роль (текст)", "все", "задать боту роль в этой беседе"),
+    ("раг", "«Грань, РАГ вопрос» или «/раг вопрос»", "все",
+     f"ответ строго по книгам из папки RAG (с источниками); если там ничего нет — "
+     f"«{RAG_NOTHING_FOUND}», без выдумок; «/раг» без вопроса — что есть в базе знаний"),
+    ("раг+", "«Грань, РАГ+ вопрос» или «/раг+ вопрос»", "все",
+     f"то же, а после «{RAG_SEPARATOR}» — ещё и обычный ответ модели"),
+    ("запомни", "«Грань, запомни» + пересланные сообщения (или текст после «запомни»)",
+     "админ" if REMEMBER_ADMIN_ONLY else "все",
+     f"перезаписать {REMEMBER_FILE} в базе знаний и переиндексировать его"),
+    ("роль", "/роль (текст)", "все", "задать боту роль в этой беседе; «/роль» — показать текущую"),
+    ("сбросить роль", "/сбросить роль", "все", f"вернуть роль по умолчанию (файл {ROLE_FILE})"),
     ("помощь", "/помощь", "все", "этот список и текущие настройки беседы"),
     ("лимит токенов", "/лимит токенов N / сброс", "админ",
      f"лимит длины ответа в токенах (стандарт {MAX_TOKENS_DEFAULT}"
@@ -1228,7 +1779,7 @@ HELP = [
     ("стоп", f"«{STOP_PHRASE.capitalize()}»", "все", "остановить бота"),
 ]
 ADMIN_COMMANDS = {"лимит токенов", "лимит символов", "сбросить лимит"}
-LLM_COMMANDS = {"пересказ", "мысль", "перескажи"}   # на паузе откладываются, расходуют лимит
+LLM_COMMANDS = {"пересказ", "мысль", "перескажи", "раг"}   # на паузе откладываются, расходуют лимит
 
 
 def help_text(peer_id):
@@ -1242,7 +1793,9 @@ def help_text(peer_id):
         "в личных сообщениях собеседнику доступны все команды.",
         "",
         "Сейчас в этой беседе:",
-        f"• лимит токенов ответа: {tokens_limit(peer_id)}",
+        f"• лимит токенов ответа: {tokens_limit(peer_id)}" + (
+            f" (до {datetime.fromtimestamp(tokens_reset_at(peer_id)):%H:%M}, потом {MAX_TOKENS_DEFAULT})"
+            if tokens_reset_at(peer_id) else ""),
         f"• лимит символов истории: {chars_limit(peer_id)}",
         f"• контекст: {context_size(peer_id)} сообщений (обычно {CONTEXT_SIZE})",
         "• ответов сегодня: " + (f"{st['count']} из {DAILY_MESSAGE_LIMIT}" if DAILY_MESSAGE_LIMIT > 0
@@ -1257,9 +1810,12 @@ def needs_admin(cmd):
     name, arg = cmd
     if name in ADMIN_COMMANDS:
         return True
+    if name == "запомни":
+        return REMEMBER_ADMIN_ONLY
     return name == "пересказ" and (arg[0] or SUMMARY_DEFAULT_COUNT) > SUMMARY_FREE_MAX
 
 
+@traced
 def run_command(req):
     """Выполняет команду. Служебные — сразу; требующие LLM на паузе ждут её конца."""
     global STOP_REQUESTED
@@ -1285,8 +1841,24 @@ def run_command(req):
         db_state_set("stopped_at", int(now()))
         STOP_REQUESTED = True
     elif name == "роль":
+        if arg is None:
+            current = db_get_role(peer_id)
+            source = ("задана в этой беседе" if DB.execute("SELECT 1 FROM roles WHERE peer_id=?",
+                                                           (peer_id,)).fetchone()
+                      else f"по умолчанию, {ROLE_FILE}" if os.path.exists(role_file_path()) else "по умолчанию")
+            send_system(peer_id, f"Роль ({source}):\n{current}\n\nИзменить: «/роль (текст)», "
+                                 "вернуть роль по умолчанию: «/сбросить роль».", reply_to_msg=message)
+            return
         db_set_role(peer_id, arg)
-        vk_send(peer_id, "Роль обновлена.", reply_to_msg=message)
+        log.info("peer=%s: роль обновлена (%d символов)", peer_id, len(arg))
+        vk_send(peer_id, "Роль обновлена." + (req.note or ""), reply_to_msg=message)
+    elif name == "сбросить роль":
+        db_del_role(peer_id)
+        send_system(peer_id, f"Роль сброшена — действует роль по умолчанию"
+                             f"{' (' + ROLE_FILE + ')' if os.path.exists(role_file_path()) else ''}.",
+                    reply_to_msg=message)
+    elif name == "запомни":
+        cmd_remember(req, arg)
     elif name == "забудь":
         # сбросить контекст беседы, история в БД остаётся
         db_state_set(f"forget_{peer_id}", req.ts + 1)
@@ -1324,36 +1896,63 @@ def cmd_limit(req, arg, key, title, default, cap, getter):
     """/лимит токенов и /лимит символов: без числа — показать, «сброс» — к стандарту."""
     peer_id = req.peer_id
     if arg is None:
-        send_system(peer_id, f"{title}: {getter(peer_id)} (стандарт {default}). "
+        current = getter(peer_id)
+        reset_at = tokens_reset_at(peer_id) if key == "tokens" else None
+        when = (f" До {datetime.fromtimestamp(reset_at):%H:%M} — потом снова {default}."
+                if reset_at else "")
+        send_system(peer_id, f"{title}: {current} (стандарт {default}).{when} "
                              f"Изменить: «/лимит {'токенов' if key == 'tokens' else 'символов'} "
                              "N», вернуть стандарт: «… сброс».", reply_to_msg=req.message)
         return
-    if not arg.isdigit():
+    number = parse_limit_value(arg)
+    if number is None:
         db_state_del(f"{key}_{peer_id}")
+        log.info("peer=%s: %s возвращён к стандарту командой", peer_id, title)
         send_system(peer_id, f"{title} возвращён к стандарту: {default}.", reply_to_msg=req.message)
         return
-    value = min(max(int(arg), 1), cap)
+    value = min(max(number, 1), cap)
     db_state_set(f"{key}_{peer_id}", f"{value}|{int(now())}")
+    log.info("peer=%s: %s = %d (от %s)", peer_id, title, value, req.from_id)
     note = ""
     if key == "tokens" and TOKEN_LIMIT_RESET_MINUTES:
-        note = f" Через {TOKEN_LIMIT_RESET_MINUTES} мин вернётся к стандарту {default}."
-    send_system(peer_id, f"{title}: {value}." + (f" (максимум {cap})" if int(arg) > cap else "")
+        reset_at = datetime.fromtimestamp(now() + TOKEN_LIMIT_RESET_MINUTES * 60)
+        note = (f" В {reset_at:%H:%M} (через {TOKEN_LIMIT_RESET_MINUTES} мин) вернётся к "
+                f"стандарту {default}.")
+    send_system(peer_id, f"{title}: {value}." + (f" (максимум {cap})" if number > cap else "")
                 + note, reply_to_msg=req.message)
 
 
+def failure_text(fail_text):
+    """«Не получилось…» + почему (LAST_LLM_ERROR) + что можно сделать."""
+    reason = LAST_LLM_ERROR or "модель не дала ответа"
+    hint = ""
+    if "лимит" in reason and "рассуждение" in reason:
+        hint = (" Можно поднять лимит: «/лимит токенов 4000» (админ) или задать в настройках "
+                "LLM_EXTRA_BODY, отключающий рассуждение.")
+    return f"{fail_text} Причина: {reason}.{hint}"
+
+
 def llm_reply(req, produce, fail_text):
-    """Ответ, на который нужен LLM: проверка дневного лимита, генерация, отправка, учёт."""
+    """Ответ, на который нужен LLM: проверка дневного лимита, генерация, отправка, учёт.
+    Если ответа нет — служебное сообщение с причиной: оно не попадает в контекст модели и не
+    считается в дневном лимите (токены за неудачный запрос при этом могли быть списаны)."""
+    global LAST_LLM_ERROR
     if daily_limit_reached(req.peer_id):
         send_system(req.peer_id, LIMIT_REACHED_TEXT, reply_to_msg=req.message)
         return False
+    LAST_LLM_ERROR = ""
     answer = produce()
-    vk_send(req.peer_id, answer or fail_text, reply_to_msg=req.message)
-    if answer:
-        count_answer(req.peer_id)
-        note_bot_answer(req.peer_id)
-    return bool(answer)
+    if not answer:
+        log.warning("peer=%s: %s", req.peer_id, failure_text(fail_text))
+        send_system(req.peer_id, failure_text(fail_text), reply_to_msg=req.message)
+        return False
+    vk_send(req.peer_id, answer, reply_to_msg=req.message)
+    count_answer(req.peer_id)
+    note_bot_answer(req.peer_id)
+    return True
 
 
+@traced
 def run_llm_command(req):
     name, arg = req.command
     peer_id = req.peer_id
@@ -1369,8 +1968,162 @@ def run_llm_command(req):
         llm_reply(req, produce, "Мысль не родилась — попробуйте позже.")
     elif name == "пересказ":
         cmd_summary(req, *arg)
+    elif name == "раг":
+        cmd_rag(req, *arg)
 
 
+# ============ База знаний ============
+def get_kb():
+    """База знаний (папка RAG_DIR): открывается при первом обращении."""
+    global KB
+    if KB is None:
+        os.makedirs(RAG_DIR, exist_ok=True)
+        embedder = None
+        if RAG_EMBEDDINGS:
+            try:
+                embedder = rag.SentenceTransformerEmbedder(RAG_EMBEDDING_MODEL)
+            except Exception as e:
+                log.warning("векторный поиск недоступен (%s) — только поиск по словам", e)
+        KB = rag.KnowledgeBase(RAG_DIR, RAG_INDEX_PATH, embedder=embedder, top_k=RAG_TOP_K,
+                               min_coverage=RAG_MIN_COVERAGE)
+    return KB
+
+
+def sync_kb():
+    """Переиндексирует новые и изменённые книги. Возвращает базу знаний."""
+    kb = get_kb()
+    changed, removed = kb.sync()
+    if changed or removed:
+        st = kb.stats()
+        log.info("База знаний: изменено %d, удалено %d; книг %d, фрагментов %d, ошибок %d",
+                 len(changed), len(removed), st["ok"], st["chunks"], st["errors"])
+    return kb
+
+
+def rag_status_text(kb):
+    st = kb.stats()
+    lines = [f"База знаний (папка {os.path.basename(RAG_DIR)} рядом с ботом): книг {st['ok']}, "
+             f"фрагментов {st['chunks']}" + (f", не прочитано файлов: {st['errors']}" if st["errors"] else "")
+             + "."]
+    books = kb.books()
+    if books:
+        lines += [f"• {b}" for b in books[:30]] + ([f"… и ещё {len(books) - 30}"] if len(books) > 30 else [])
+    lines.append("Спросить: «Грань, РАГ вопрос» (только по книгам) или «Грань, РАГ+ вопрос» "
+                 f"(по книгам, а после «{RAG_SEPARATOR}» — ответ модели).")
+    return "\n".join(lines)
+
+
+@traced
+def cmd_rag(req, plus, query):
+    """«РАГ вопрос»: ответ строго по найденным фрагментам книг; ничего не нашлось — служебное
+    сообщение без запроса к LLM. «РАГ+»: после «---» — ещё и обычный ответ модели."""
+    peer_id = req.peer_id
+    if not query:
+        query = quoted_content(req.message)[0].strip()
+    try:
+        kb = sync_kb()
+    except Exception as e:
+        log.exception("база знаний: %s", e)
+        send_system(peer_id, f"База знаний недоступна: {e}", reply_to_msg=req.message)
+        return
+    if not query:
+        send_system(peer_id, rag_status_text(kb), reply_to_msg=req.message)
+        return
+    if daily_limit_reached(peer_id):
+        send_system(peer_id, LIMIT_REACHED_TEXT, reply_to_msg=req.message)
+        return
+    hits = kb.search(query)
+    log.info("peer=%s: РАГ%s «%s» — найдено фрагментов: %d", peer_id, "+" if plus else "",
+             shorten(query, 100), len(hits))
+    max_tokens = max(RAG_MAX_TOKENS, tokens_limit(peer_id))
+    answer = None
+    if hits:
+        system, prompt = rag.build_prompt(query, hits, RAG_MAX_CONTEXT_CHARS)
+        raw = llm_call(system, prompt, max_tokens=max_tokens)
+        if not raw:
+            send_system(peer_id, failure_text("Не получилось ответить по базе знаний."),
+                        reply_to_msg=req.message)
+            return
+        answer = rag.parse_answer(raw, hits)
+        if answer is None:
+            log.info("peer=%s: во фрагментах ответа нет (%s)", peer_id, rag.NO_ANSWER)
+    if answer is None:
+        send_system(peer_id, RAG_NOTHING_FOUND, reply_to_msg=req.message)
+    if not plus:
+        if answer:
+            vk_send(peer_id, answer, reply_to_msg=req.message)
+            count_answer(peer_id)
+            note_bot_answer(peer_id)
+        return
+    extra = rag_free_answer(peer_id, query, max_tokens)
+    if not extra and not answer:
+        send_system(peer_id, failure_text("Не получилось сформулировать ответ."), reply_to_msg=req.message)
+        return
+    if answer:
+        text = f"{answer}\n\n{RAG_SEPARATOR}\n" + (extra or failure_text("Ответ модели не получился."))
+    else:
+        text = f"{RAG_SEPARATOR}\n{extra}"
+    vk_send(peer_id, text, reply_to_msg=req.message)
+    count_answer(peer_id)
+    note_bot_answer(peer_id)
+
+
+def rag_free_answer(peer_id, query, max_tokens):
+    """РАГ+: обычный ответ модели (с ролью беседы), без базы знаний."""
+    system = build_system_prompt(db_get_role(peer_id))
+    prompt = f"Ответь на вопрос своими знаниями.\n\nВОПРОС: {query}"
+    return clean_answer(llm_call(system, prompt, max_tokens=max_tokens))
+
+
+def remember_content(req, text_arg):
+    """Что запомнить: пересланные сообщения или reply, иначе текст после «запомни»."""
+    message = req.message
+    fwd = list(message.get("fwd_messages") or [])
+    if not fwd and message.get("reply_message"):
+        fwd = [message["reply_message"]]
+    if fwd:
+        authors = {f.get("from_id") for f in fwd}
+        parts = []
+        for f in fwd:
+            body = render_message(f)[0].strip()
+            if body:
+                parts.append(f"{display_name(f.get('from_id', 0))}: {body}" if len(authors) > 1 else body)
+        return "\n\n".join(parts)
+    return (text_arg or "").strip()
+
+
+@traced
+def cmd_remember(req, text_arg):
+    """«Грань, запомни» + пересланное: перезаписать RAG/Рефлексия.txt и переиндексировать его."""
+    peer_id = req.peer_id
+    content = remember_content(req, text_arg)
+    if not content:
+        send_system(peer_id, f"Что запомнить? Перешлите сообщения с текстом «Грань, запомни» "
+                             f"(или напишите текст после «запомни») — он заменит {REMEMBER_FILE} "
+                             "в базе знаний.", reply_to_msg=req.message)
+        return
+    os.makedirs(RAG_DIR, exist_ok=True)
+    path = os.path.join(RAG_DIR, REMEMBER_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content.rstrip() + "\n")
+    if os.path.exists(path):
+        os.replace(path, path + ".bak")       # прежняя версия — на всякий случай
+    os.replace(tmp, path)
+    try:
+        chunks = get_kb().index_file(REMEMBER_FILE)
+    except Exception as e:
+        log.exception("индексация %s: %s", REMEMBER_FILE, e)
+        send_system(peer_id, f"{REMEMBER_FILE} записан ({len(content)} символов), но переиндексировать "
+                             f"не удалось: {e}", reply_to_msg=req.message)
+        return
+    log.info("peer=%s: %s перезаписан (%d символов, %d фрагментов) от %s", peer_id, REMEMBER_FILE,
+             len(content), chunks, req.from_id)
+    send_system(peer_id, f"Запомнила: {REMEMBER_FILE} перезаписан ({len(content)} символов, "
+                         f"{chunks} фрагментов в базе знаний).", reply_to_msg=req.message)
+
+
+@traced
 def cmd_summary(req, count, start):
     """/пересказ N — последние N сообщений; /пересказ N от ДАТА — N сообщений с даты."""
     peer_id = req.peer_id
@@ -1402,10 +2155,11 @@ def cmd_summary(req, count, start):
               "Не получилось пересказать.")
 
 
+@traced
 def answer_batch(peer_id, requests):
     """Один ответ на все обращения, накопившиеся за BATCH_WAIT_SEC (или за паузу)."""
     last = requests[-1]
-    exclude = [r.rowid for r in requests if r.rowid]
+    exclude = [rid for r in requests for rid in r.rowids]
 
     def produce():
         forget_ts = int(db_state_get(f"forget_{peer_id}", 0))
@@ -1427,6 +2181,7 @@ def answer_batch(peer_id, requests):
 
 
 # ============ Обработчик ============
+@traced
 def handle_message(message):
     peer_id = message["peer_id"]
     from_id = message.get("from_id", 0)
@@ -1447,21 +2202,51 @@ def handle_message(message):
         return  # в личке бот молчит, пока это не разрешено настройкой
 
     note_activity(peer_id, now())
-    req = Request(message, rowid, full_text, images)
+    st = peer_state(peer_id)
+    part = {"rowid": rowid, "text": full_text, "images": images, "ts": ts, "len": len(text),
+            "added": now()}
+    starts_command = text.lstrip().startswith("/") or is_stop_request(text)
 
-    cmd = parse_command(text)
+    # ВК режет длинные сообщения на части по ~4096 символов: продолжение /роль или «запомни»…
+    buf = st.buffers.get(from_id)
+    if buf:
+        if not starts_command and continue_buffer(peer_id, from_id, buf, text, part):
+            return
+        finish_buffer(peer_id, from_id)
+    # …и продолжение длинного обращения, которое ещё ждёт ответа
+    if not starts_command:
+        cont = find_continuation(st, from_id, ts)
+        if cont:
+            cont.add_part(part)
+            st.last_pending_ts = now()
+            log.info("peer=%s: часть %d длинного обращения от %s (%d символов)", peer_id,
+                     cont.parts, from_id, len(text))
+            return
+
+    addressed = is_addressed_to_bot(message)
+    req = Request(message, rowid, full_text, images)
+    cmd = parse_command(text, addressed)
     if cmd is None and has_trigger(text) and is_summary_request(text) and quoted_content(message)[0]:
         cmd = ("перескажи", None)
     if cmd:
+        st.chains.pop(from_id, None)
         req.command = cmd
+        if cmd[0] in SPLIT_COMMANDS and buffer_may_continue(cmd, text, message):
+            start_buffer(st, req, text)
+            return
         run_command(req)
         return
 
-    if not is_addressed_to_bot(message):
+    if not addressed:
+        note_unaddressed_part(st, from_id, part)
         return
     if not should_respond(ts):
         log.info("Сообщение старое — не отвечаем.")
         return
+    chain = take_chain(st, from_id, ts)
+    if chain:
+        req.prepend(chain)
+        log.info("peer=%s: обращение от %s собрано из %d сообщений", peer_id, from_id, req.parts)
     enqueue(req)  # ответ — в process_pending, когда все допишут
 
 
@@ -1475,21 +2260,40 @@ def handle_event(event):
 
 
 # ============ Main ============
+def load_env():
+    """.env рядом с ботом, затем в текущей папке, затем от bot5 (если переходим с него)."""
+    from dotenv import load_dotenv
+    for path in (os.path.join(BOT_DIR, ".env"), None, os.path.join(BOT_DIR, "..", "bot5", ".env")):
+        if path is None:
+            load_dotenv()
+        elif os.path.exists(path):
+            load_dotenv(path)
+
+
 def init():
     """Подключение к БД, ВК и LLM. Импорты здесь, чтобы тесты не требовали токенов."""
     global DB, vk, llm_client, BOT_GROUP_ID, VK_USER_TOKEN, ADMIN_IDS
-    from dotenv import load_dotenv
     import vk_api
     from vk_api.bot_longpoll import VkBotLongPoll
     from openai import OpenAI
 
-    load_dotenv()
+    load_env()
     group_id = int(os.getenv("VK_GROUP_ID"))
     BOT_GROUP_ID = -group_id
     VK_USER_TOKEN = os.getenv("VK_USER_TOKEN") or None
     ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS") or "")}
     DB = db_init(DB_PATH)
-    migrate_from_bot4()
+    migrate_from_bot5()
+    if not os.path.exists(role_file_path()):
+        log.info("Файла роли %s нет — роль по умолчанию из DEFAULT_ROLE", role_file_path())
+    default_role()
+    try:
+        kb = sync_kb()
+        st = kb.stats()
+        log.info("База знаний %s: книг %d, фрагментов %d, ошибок %d (лемматизация: %s, векторы: %s)",
+                 RAG_DIR, st["ok"], st["chunks"], st["errors"], st["lemmatizer"], st["embeddings"])
+    except Exception as e:
+        log.exception("база знаний: %s", e)
     session = vk_api.VkApi(token=os.getenv("VK_TOKEN"))
     vk = session.get_api()
     llm_client = OpenAI(api_key=os.getenv("PROXYAPI_KEY"), base_url=PROXYAPI_BASE_URL)
@@ -1502,13 +2306,34 @@ def _graceful_signal(signum, frame):
     STOP_REQUESTED = True
 
 
-def main():
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Бот «Грань» для чата сообщества ВКонтакте")
+    ap.add_argument("--debug", action="store_true",
+                    help="подробный лог основных функций (то же — переменная окружения BOT_DEBUG=1)")
+    ap.add_argument("--log-file", help="писать лог ещё и в этот файл")
+    ap.add_argument("--restart-after-hours", type=float, default=0,
+                    help=f"проработав столько часов, выйти с кодом {RESTART_EXIT_CODE} для перезапуска "
+                         "(его делает bot6_server.py); выход — когда никто не ждёт ответа")
+    args = ap.parse_args(argv)
+    args.debug = args.debug or os.getenv("BOT_DEBUG", "").strip().lower() in ("1", "true", "yes", "да")
+    return args
+
+
+def main(argv=None):
+    global STOP_REQUESTED, EXIT_CODE
+    args = parse_args(argv)
+    setup_logging(args.debug, args.log_file)
     signal.signal(signal.SIGINT, _graceful_signal)
     signal.signal(signal.SIGTERM, _graceful_signal)
+    if hasattr(signal, "SIGBREAK"):     # Windows: Ctrl+Break и закрытие консоли
+        signal.signal(signal.SIGBREAK, _graceful_signal)
 
+    started = time.time()
     longpoll = init()
     load_history()
-    log.info("Слушаем Long Poll... (для остановки: '%s')", STOP_PHRASE)
+    log.info("Слушаем Long Poll... (для остановки: '%s')%s%s", STOP_PHRASE,
+             " [подробный лог]" if args.debug else "",
+             f" [перезапуск через {args.restart_after_hours:g} ч]" if args.restart_after_hours else "")
 
     # check() вместо listen(): Long Poll возвращается раз в LONGPOLL_WAIT_SEC,
     # и между проверками бот отвечает на накопившиеся обращения
@@ -1530,13 +2355,20 @@ def main():
             process_pending()
         except Exception as e:
             log.exception("process_pending: %s", e)
+        if (args.restart_after_hours and time.time() - started >= args.restart_after_hours * 3600
+                and is_idle()):
+            log.info("Плановый перезапуск: бот работает %.1f ч", (time.time() - started) / 3600)
+            EXIT_CODE = RESTART_EXIT_CODE
+            STOP_REQUESTED = True
 
     log.info("Бот остановлен.")
-    try:
-        DB.close()
-    except Exception:
-        pass
-    sys.exit(0)
+    for closable in (KB, DB):
+        try:
+            if closable is not None:
+                closable.close()
+        except Exception:
+            pass
+    sys.exit(EXIT_CODE)
 
 
 if __name__ == "__main__":
