@@ -23,3 +23,11 @@ build/
 
 # Memory files
 analyze.txt
+
+# bot5/bot6: базы, индекс базы знаний, логи
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+Прочее/bot6/logs/
+Прочее/bot6/RAG/
