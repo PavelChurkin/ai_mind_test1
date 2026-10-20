@@ -121,6 +121,9 @@ class Bot6Case(unittest.TestCase):
         bot6.PEERS.clear()
         bot6._admin_cache.clear()
         bot6._image_cache.clear()
+        bot6._ssl_contexts = None
+        bot6._role_file_cache = (None, None)
+        bot6.DEBUG_MODE = False
         bot6._last_limit_check = 0.0
         bot6.LAST_LLM_ERROR = ""
         # файл роли, база знаний и их индексы — во временной папке, а не рядом с ботом

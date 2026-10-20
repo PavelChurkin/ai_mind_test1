@@ -1996,18 +1996,22 @@ def sync_kb():
     if changed or removed:
         st = kb.stats()
         log.info("База знаний: изменено %d, удалено %d; книг %d, фрагментов %d, ошибок %d",
-                 len(changed), len(removed), st["ok"], st["chunks"], st["errors"])
+                 changed, removed, st["ok"], st["chunks"], len(st["errors"]))
+        for path, error in st["errors"]:
+            log.warning("База знаний: не прочитан %s: %s", path, error)
     return kb
 
 
 def rag_status_text(kb):
     st = kb.stats()
     lines = [f"База знаний (папка {os.path.basename(RAG_DIR)} рядом с ботом): книг {st['ok']}, "
-             f"фрагментов {st['chunks']}" + (f", не прочитано файлов: {st['errors']}" if st["errors"] else "")
+             f"фрагментов {st['chunks']}" + (f", не прочитано файлов: {len(st['errors'])}" if st["errors"] else "")
              + "."]
     books = kb.books()
-    if books:
-        lines += [f"• {b}" for b in books[:30]] + ([f"… и ещё {len(books) - 30}"] if len(books) > 30 else [])
+    for path, title, chunks, error in books[:30]:
+        lines.append(f"• {path} — «{title}», " + (f"не прочитан: {error}" if error else f"фрагментов {chunks}"))
+    if len(books) > 30:
+        lines.append(f"… и ещё {len(books) - 30}")
     lines.append("Спросить: «Грань, РАГ вопрос» (только по книгам) или «Грань, РАГ+ вопрос» "
                  f"(по книгам, а после «{RAG_SEPARATOR}» — ответ модели).")
     return "\n".join(lines)
@@ -2291,7 +2295,7 @@ def init():
         kb = sync_kb()
         st = kb.stats()
         log.info("База знаний %s: книг %d, фрагментов %d, ошибок %d (лемматизация: %s, векторы: %s)",
-                 RAG_DIR, st["ok"], st["chunks"], st["errors"], st["lemmatizer"], st["embeddings"])
+                 RAG_DIR, st["ok"], st["chunks"], len(st["errors"]), st["lemmatizer"], st["embeddings"])
     except Exception as e:
         log.exception("база знаний: %s", e)
     session = vk_api.VkApi(token=os.getenv("VK_TOKEN"))
