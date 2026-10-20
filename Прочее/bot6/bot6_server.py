@@ -12,7 +12,7 @@
 #     задержка снова 5 с); логи при этом не стираются — в них причина падения;
 #   * бот остановлен командой «Грань, стоп машина» (код 0) — сервер тоже завершается;
 #   * бот завис и не вышел через час после срока перезапуска — процесс останавливается
-#     и запускается заново;
+#     и запускается заново (логи сохраняются — в них видно, на чём он завис);
 #   * Ctrl+C / SIGTERM — сервер передаёт сигнал боту, ждёт его завершения и выходит.
 import os
 import sys
@@ -100,7 +100,7 @@ def run(args, popen=subprocess.Popen, sleep=time.sleep, clock=time.time):
         started = clock()
         say(f"запуск: {' '.join(bot_command(args))}", args.log_file)
         child = popen(bot_command(args), cwd=BOT_DIR)
-        code = None
+        code, hung = None, False
         while code is None:
             try:
                 code = child.wait(timeout=5)
@@ -108,12 +108,16 @@ def run(args, popen=subprocess.Popen, sleep=time.sleep, clock=time.time):
                 if args.restart_days and clock() - started > hang_after:
                     say(f"бот не перезапустился через {hang_after / 3600:.0f} ч — останавливаю",
                         args.log_file)
-                    stop_child(child)
-                    code = RESTART_EXIT_CODE
+                    code, hung = stop_child(child), True
         child = None
         if stop_requested:
             say(f"остановлен (код бота {code})", args.log_file)
             return 0
+        if hung:
+            # лог не стираем: в нём то, на чём бот завис; сотрётся при следующем плановом перезапуске
+            say(f"бот остановлен (код {code}) — запускаю заново, логи сохранены", args.log_file)
+            backoff = BACKOFF_START_SEC
+            continue
         if code == RESTART_EXIT_CODE:
             freed = clear_logs(args.log_file)
             say(f"плановый перезапуск, логи очищены ({freed / 1024 / 1024:.1f} МБ)", args.log_file)
