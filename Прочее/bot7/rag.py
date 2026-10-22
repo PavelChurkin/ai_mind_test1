@@ -1,4 +1,4 @@
-# rag.py — база знаний (RAG) для бота «Грань» (bot6), отдельный модуль без ВК и LLM.
+# rag.py — база знаний (RAG) для бота «Грань» (bot6, bot7), отдельный модуль без ВК и LLM.
 #
 # Книги кладутся в папку (по умолчанию RAG рядом с ботом): txt, doc, docx, pdf (с текстовым
 # слоем), epub, fb2, fb2.zip. Модуль разбирает их на фрагменты, строит индекс в SQLite и ищет
@@ -775,8 +775,21 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_prompt(query, hits, max_chars=MAX_CONTEXT_CHARS):
-    """(system, user) — строгий промпт: ответ только по пронумерованным фрагментам."""
+CHAT_RULES = (
+    "Ниже даны фрагменты из базы знаний (книг), найденные по сообщению собеседника. "
+    "Отвечай только по ним:\n"
+    "1. Бери сведения только из фрагментов. Ничего не добавляй от себя, не используй собственные "
+    "знания, не додумывай и не обобщай сверх написанного. История чата — только чтобы понять, "
+    "о чём спрашивают; сведения из неё не бери.\n"
+    f"2. Если во фрагментах нет ответа, ответь ровно одним словом: {NO_ANSWER}\n"
+    "3. После каждого утверждения ставь в квадратных скобках номер фрагмента, например [2].\n"
+    "4. Сохраняй свою роль и манеру речи, но не жертвуй точностью."
+)
+
+
+def format_fragments(hits, max_chars=MAX_CONTEXT_CHARS):
+    """«[1] источник\nтекст\n\n[2] …» — сколько фрагментов влезает в max_chars (первый — всегда).
+    Возвращает (текст, сколько фрагментов вошло)."""
     blocks, used = [], 0
     for i, h in enumerate(hits, 1):
         block = f"[{i}] {h.source()}\n{h.text}"
@@ -784,7 +797,13 @@ def build_prompt(query, hits, max_chars=MAX_CONTEXT_CHARS):
             break
         blocks.append(block)
         used += len(block) + 2
-    user = "ФРАГМЕНТЫ:\n\n" + "\n\n".join(blocks) + f"\n\nВОПРОС: {query.strip()}"
+    return "\n\n".join(blocks), len(blocks)
+
+
+def build_prompt(query, hits, max_chars=MAX_CONTEXT_CHARS):
+    """(system, user) — строгий промпт: ответ только по пронумерованным фрагментам."""
+    fragments, _n = format_fragments(hits, max_chars)
+    user = "ФРАГМЕНТЫ:\n\n" + fragments + f"\n\nВОПРОС: {query.strip()}"
     return SYSTEM_PROMPT, user
 
 

@@ -1,4 +1,4 @@
-# filosof.py — философские размышления для bot5 и bot6 (перенесено из проекта ai_filosof)
+# filosof.py — философские размышления для bot5, bot6 и bot7 (перенесено из проекта ai_filosof)
 #
 # Источник: https://github.com/PavelChurkin/ai_filosof (filosof_bot.py, ThoughtGenerator,
 # коммит b48af94). Списки слов nouns.json, verbs.json, adject.json скопированы оттуда же
@@ -27,12 +27,15 @@ SAMPLE_MIN = 100                   # размер случайной выбор�
 SAMPLE_MAX = 20000
 MAX_ITERATIONS = 20000             # предел перебора в optimized_choice_lst
 
-SYSTEM_PROMPT = "Ты размышляющий бот"
+# bot7: «не больше 100 слов» убрано — с этим ограничением мысль не генерировалась (модель
+# тратила весь лимит токенов на рассуждение, ответ пустой, finish_reason=length); вместо этого
+# в системном промпте — «Пиши кратко».
+SYSTEM_PROMPT = "Ты размышляющий бот. Пиши кратко."
 PROMPT_IMAGE = ("Даны следующие слова:\n{words}\n\n"
-                "Выбери из них только слова. По этим словам сформируй образ, "
-                "не больше 100 слов, с определением своей роли")
+                "Выбери из них только слова. По этим словам сформируй образ "
+                "с определением своей роли")
 PROMPT_QUESTION = "{image}\n\nСформируй вопрос"
-PROMPT_ANSWER = "{question}\n\nОтветь на вопрос, не больше 100 слов"
+PROMPT_ANSWER = "{question}\n\nОтветь на вопрос"
 
 
 def optimized_choice_lst(lst, max_iterations=MAX_ITERATIONS, rng=random):

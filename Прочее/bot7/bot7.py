@@ -1,19 +1,18 @@
-# bot6.py — бот «Грань» для чата сообщества ВКонтакте (следующая версия bot5)
+# bot7.py — бот «Грань» для чата сообщества ВКонтакте (следующая версия bot6, задача #17)
 #
-# Что добавлено по сравнению с bot5 (подробно — в README.md этой папки):
-#   * причина пустых ответов видна: «Не получилось…» приходит служебным сообщением с причиной
-#     (модель потратила лимит токенов на рассуждение, ошибка API…), при пустом ответе из-за
-#     лимита — один повтор с EMPTY_ANSWER_RETRY_TOKENS; одна строка лога на каждый запрос к LLM;
-#   * картинки: при ошибке сертификата — повтор с сертификатами certifi (и IMAGE_CA_FILE);
-#     ссылка на картинку больше не уходит прокси (он получал 429 от серверов ВК);
-#   * режим подробного лога (--debug) и запись лога в файл (--log-file);
-#   * серверный режим bot6_server.py: перезапуск раз в неделю с очисткой логов;
-#   * длинные обращения и /роль, которые ВК разбил на несколько сообщений, склеиваются;
-#   * база знаний (rag.py, папка RAG): «Грань, РАГ вопрос», «РАГ+» — ещё и ответ LLM после «---»;
-#   * «Грань, запомни» + пересланное — перезаписать RAG/Рефлексия.txt и переиндексировать;
-#   * роль по умолчанию — из файла Роль.txt рядом с ботом, /сбросить роль — вернуться к ней;
-#   * /лимит токенов понимает «3000», «: 3000», «30 000», «30к»; показывает, когда вернётся к
-#     стандарту, и сообщает в чат, когда вернулся.
+# Что изменилось по сравнению с bot6 (подробно — в README.md этой папки):
+#   * база знаний — режим беседы «/раг вкл» / «/раг выкл»: во включённом режиме перед каждым
+#     ответом — поиск по базе знаний, ответ строго по найденным фрагментам; не нашлось —
+#     ответ начинается с «Поиск по базе знаний не дал результата.»; «РАГ+» убран;
+#     «/лимит чанков N» — сколько фрагментов передавать модели;
+#   * «/рассуждения вкл» / «/рассуждения выкл»: рассуждение модели включено и показывается
+#     в начале ответа между маркерами #рассуждения# (по умолчанию выключено);
+#   * /мысль — без повтора и без увеличения лимита токенов; в промптах философа вместо
+#     «не больше 100 слов» — «пиши кратко»;
+#   * размер контекста: «/контекст N», «/автоконтекст» (по пересланному сообщению или
+#     reply), «/автоконтекст 2 ч», «/сброс контекста [N]»; рост контекста в споре убран;
+#   * остановка: «0» + Enter в терминале; «Грань, стоп машина» — только админ;
+#   * ansible/ — установка бота на чистый Linux-сервер.
 import os
 import re
 import ssl
@@ -23,6 +22,7 @@ import math
 import time
 import base64
 import signal
+import threading
 import sqlite3
 import argparse
 import functools
@@ -42,7 +42,8 @@ import rag      # noqa: E402
 # ============ НАСТРОЙКИ ============
 BOT_NAME = "Грань разумного"
 TRIGGER_RE = re.compile(r"\bгрань\b", re.IGNORECASE)
-STOP_PHRASE = "грань, стоп машина"
+STOP_PHRASE = "грань, стоп машина"   # остановка из чата — только админ (ADMIN_IDS или админ беседы)
+TERMINAL_STOP = True               # «0» + Enter в терминале, где запущен бот, — остановить бота
 
 # --- личные сообщения и права ---
 ALLOW_PRIVATE_MESSAGES = False     # можно ли боту отвечать в личных сообщениях (по умолчанию — нет)
@@ -50,11 +51,11 @@ ADMIN_CACHE_MINUTES = 10           # сколько минут помнить с
 # ADMIN_IDS в .env — id пользователей, которые админы бота в любой беседе (через запятую)
 
 # --- контекст ---
-CONTEXT_SIZE = 30                  # обычный размер контекста (последних сообщений)
-CONTEXT_SIZE_MAX = 300             # потолок роста контекста в активном споре
-CONTEXT_RESET_MINUTES = 5          # столько минут без новых сообщений — контекст снова CONTEXT_SIZE
+CONTEXT_SIZE = 30                  # стандартный размер контекста (последних сообщений)
+CONTEXT_SIZE_MAX = 500             # больше этого /контекст и /автоконтекст не поставят
 CONTEXT_MIN_MESSAGES = 10          # столько последних сообщений берём всегда, даже если они старые
-CONTEXT_MEMORY_HOURS = 12          # более старые сообщения — только в пределах CONTEXT_MIN_MESSAGES (0 — без ограничения)
+CONTEXT_MEMORY_HOURS = 12          # более старые сообщения — только в пределах CONTEXT_MIN_MESSAGES (0 — без ограничения);
+                                   # при размере, заданном /контекст или /автоконтекст, не действует
 MAX_CONTEXT_CHARS = 12000          # стандартный лимит символов истории в запросе (меняется /лимит символов)
 MAX_CONTEXT_CHARS_CAP = 300000     # больше этого /лимит символов не поставит
 CONTEXT_SUMMARY_CHARS = 2000       # размер сжатого пересказа старой части истории
@@ -64,8 +65,16 @@ CONTEXT_KEEP_SHARE = 0.6           # после сжатия свежая час
 MAX_TOKENS_DEFAULT = 800           # стандартный лимит выходных токенов (меняется /лимит токенов)
 MAX_TOKENS_CAP = 64000             # больше этого /лимит токенов не поставит
 TOKEN_LIMIT_RESET_MINUTES = 60     # через столько минут /лимит токенов сам вернётся к стандарту (0 — не вернётся)
-EMPTY_ANSWER_RETRY_TOKENS = 3000   # пустой ответ из-за лимита (всё ушло на рассуждение) — один повтор с таким лимитом (0 — без повтора)
-LLM_EXTRA_BODY = None              # доп. параметры запроса к модели, например {"thinking": {"type": "disabled"}}
+EMPTY_ANSWER_RETRY_TOKENS = 3000   # пустой ответ из-за лимита (всё ушло на рассуждение) — один повтор с таким лимитом
+                                   # (0 — без повтора); у /мысль повтора нет
+LLM_EXTRA_BODY = None              # доп. параметры каждого запроса к модели, например {"top_k": 20}
+
+# --- рассуждение модели (/рассуждения вкл|выкл) ---
+REASONING_DEFAULT = False          # рассуждения в новой беседе: False — выключены
+REASONING_ON_BODY = {"thinking": {"type": "enabled"}}    # что добавить к запросу, когда рассуждения включены
+REASONING_OFF_BODY = {"thinking": {"type": "disabled"}}  # …и когда выключены (None — ничего: решает модель)
+REASONING_MARK = "#рассуждения#"   # рассуждение в начале ответа — между двумя такими строками
+REASONING_MAX_CHARS = 6000         # длиннее — рассуждение показывается с сокращением в середине
 BATCH_WAIT_SEC = 8                 # ждём столько секунд без новых обращений и отвечаем на все разом
 BATCH_MAX_WAIT_SEC = 60            # но не дольше этого с первого обращения
 PAUSE_DEFAULT_MINUTES = 1          # /пауза без числа
@@ -84,14 +93,16 @@ ROLE_FILE = "Роль.txt"             # роль по умолчанию — ф
 # --- база знаний (RAG) ---
 RAG_DIR = os.path.join(BOT_DIR, "RAG")             # книги: txt, doc, docx, pdf, epub, fb2
 RAG_INDEX_PATH = os.path.join(BOT_DIR, "rag_index.db")
-RAG_TOP_K = 6                      # сколько найденных фрагментов передавать модели
+RAG_TOP_K = 6                      # сколько найденных фрагментов передавать модели (меняется /лимит чанков)
+RAG_TOP_K_MAX = 30                 # больше этого /лимит чанков не поставит
 RAG_MIN_COVERAGE = 0.5             # фрагмент подходит, если в нём есть эта доля значимых слов запроса
-RAG_MAX_CONTEXT_CHARS = 8000       # сколько символов фрагментов передавать модели
+RAG_MAX_CONTEXT_CHARS = 40000      # предохранитель: больше стольких символов фрагментов модели не уходит
 RAG_MAX_TOKENS = 1500              # лимит токенов ответа по базе знаний (берётся больший из этого и /лимит токенов)
 RAG_EMBEDDINGS = False             # True — ещё и векторный поиск (pip install sentence-transformers)
 RAG_EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
-RAG_NOTHING_FOUND = "В базе знаний ничего не нашлось."
-RAG_SEPARATOR = "---"              # РАГ+: ответ LLM идёт после этой строки
+RAG_NOTHING_FOUND = "В базе знаний ничего не нашлось."                 # «/раг вопрос» без находок
+RAG_MODE_DEFAULT = False           # режим «/раг вкл» в новой беседе
+RAG_NO_RESULT_PREFIX = "Поиск по базе знаний не дал результата."     # режим «/раг вкл»: начало ответа без находок
 REMEMBER_FILE = "Рефлексия.txt"    # «Грань, запомни» перезаписывает этот файл в RAG_DIR
 REMEMBER_ADMIN_ONLY = True         # «Грань, запомни» — только админ беседы (False — все)
 
@@ -121,16 +132,16 @@ IMAGE_MAX_SIDE = 1280              # предпочитаем размер фо�
 IMAGE_DOWNLOAD_TIMEOUT = 15
 IMAGE_CA_FILE = None               # доп. корневой сертификат (.pem/.crt) для скачивания картинок, путь от папки бота
 IMAGE_SSL_INSECURE_FALLBACK = False  # True — если сертификат не проверился, скачать без проверки (небезопасно)
-IMAGE_URL_FALLBACK = False         # True — не скачалась картинка в base64-режиме — передать модели ссылку (как bot5)
+IMAGE_URL_FALLBACK = False         # True — не скачалась картинка в base64-режиме — передать модели ссылку (как в bot5)
 IMAGE_CACHE_SIZE = 16              # столько последних скачанных картинок держать в памяти
 
 LLM_MIN_INTERVAL_SEC = 3           # не чаще одного запроса к LLM за столько секунд
 VK_MESSAGE_LIMIT = 4000            # ВК режет сообщения длиннее 4096 символов
 LONGPOLL_WAIT_SEC = 1              # Long Poll возвращается не реже — чтобы вовремя отвечать пакетам
 
-DB_PATH = os.path.join(BOT_DIR, "gran6.db")
-OLD_DB_NAME = "gran5.db"           # БД bot5: ищется рядом с ботом, в текущей папке и в ../bot5
-OLD_DB_PATH = None                 # явный путь к БД bot5 (если задан — ищется только он)
+DB_PATH = os.path.join(BOT_DIR, "gran7.db")
+OLD_DB_NAME = "gran6.db"           # БД bot6: ищется рядом с ботом, в текущей папке и в ../bot6
+OLD_DB_PATH = None                 # явный путь к БД bot6 (если задан — ищется только он)
 
 # --- лог и перезапуск ---
 LOG_MAX_MB = 50                    # файл лога (--log-file) больше этого — ротация
@@ -156,6 +167,9 @@ LIMIT_REACHED_TEXT = "Извините, сегодня лимит сообщен
 STOP_REQUESTED = False
 EXIT_CODE = 0
 LAST_LLM_ERROR = ""                # почему последний запрос к LLM не дал ответа (для сообщения в чат)
+LLM_REASONINGS = []                # рассуждения модели за текущий ответ (может быть несколько запросов)
+REASONING_ON = False               # рассуждения включены для текущего ответа (ставит with_reasoning)
+REASONING_PARAM_OK = True          # False — API отверг REASONING_*_BODY, больше не передаём
 
 # Заполняются в init() — так модуль можно импортировать в тестах без токенов и сети.
 DB = None
@@ -167,7 +181,7 @@ ADMIN_IDS = set()
 _last_llm_call = 0.0
 _last_limit_check = 0.0
 _admin_cache = {}                  # peer_id -> (когда загружен, {id админов})
-PEERS = {}                         # peer_id -> PeerState: очередь обращений, пауза, размер контекста
+PEERS = {}                         # peer_id -> PeerState: очередь обращений, пауза, недописанные команды
 FILOSOF = filosof.ThoughtGenerator()
 KB = None                          # база знаний rag.KnowledgeBase (get_kb)
 _image_cache = OrderedDict()       # url -> часть запроса с картинкой
@@ -319,19 +333,24 @@ def _rows(rows):
     return [(r[0], r[1], r[2], r[3], r[4], json.loads(r[5]) if r[5] else []) for r in rows]
 
 
+NOT_SYSTEM_SQL = "NOT (is_bot=1 AND COALESCE(text,'') LIKE ?)"   # параметр: SYSTEM_MARK + "%"
+
+
 def db_get_context(peer_id, limit, since_ts=None, min_rows=0, exclude_ids=(), after_ts=None):
     """
     Последние `limit` сообщений беседы в порядке старые → новые.
     since_ts  — мягкая граница: старше неё берём не больше `min_rows` последних сообщений;
     after_ts  — жёсткая граница (команда /забудь): старше неё не берём ничего;
     exclude_ids — не включать эти сообщения (те, на которые сейчас отвечаем).
+    Служебные сообщения бота (SYSTEM_MARK) не считаются: «/контекст 50» — 50 настоящих сообщений.
     """
     exclude_ids = list(exclude_ids) or [-1]
     marks = ",".join("?" * len(exclude_ids))
     rows = DB.execute(
         f"SELECT id,from_id,is_bot,text,ts,images FROM messages "
-        f"WHERE peer_id=? AND id NOT IN ({marks}) AND ts>=? ORDER BY ts DESC, id DESC LIMIT ?",
-        (peer_id, *exclude_ids, after_ts or 0, limit),
+        f"WHERE peer_id=? AND id NOT IN ({marks}) AND ts>=? AND {NOT_SYSTEM_SQL} "
+        f"ORDER BY ts DESC, id DESC LIMIT ?",
+        (peer_id, *exclude_ids, after_ts or 0, SYSTEM_MARK + "%", limit),
     ).fetchall()
     rows.reverse()
     if since_ts is not None:
@@ -447,20 +466,20 @@ def db_upsert_user(user_id, first_name, last_name=""):
 
 
 def find_old_db():
-    """БД bot5: OLD_DB_PATH, иначе gran5.db рядом с ботом, в текущей папке или в ../bot5."""
+    """БД bot6: OLD_DB_PATH, иначе gran6.db рядом с ботом, в текущей папке или в ../bot6."""
     if OLD_DB_PATH:
         return OLD_DB_PATH if os.path.exists(OLD_DB_PATH) else None
-    for folder in (BOT_DIR, os.getcwd(), os.path.join(BOT_DIR, "..", "bot5")):
+    for folder in (BOT_DIR, os.getcwd(), os.path.join(BOT_DIR, "..", "bot6")):
         path = os.path.join(folder, OLD_DB_NAME)
         if os.path.exists(path):
             return path
     return None
 
 
-def migrate_from_bot5(old_path=None):
-    """Переносит из БД bot5 сообщения, роли, имена и настройки бесед (/забудь, /лимит символов,
+def migrate_from_bot6(old_path=None):
+    """Переносит из БД bot6 сообщения, роли, имена и настройки бесед (/забудь, /лимит символов,
     начало истории чата): схема та же, загружать историю из ВК заново не нужно."""
-    if db_state_get("migrated_bot5") == "1":
+    if db_state_get("migrated_bot6") == "1":
         return
     old_path = old_path or find_old_db()
     if not old_path:
@@ -485,10 +504,10 @@ def migrate_from_bot5(old_path=None):
         DB.commit()
         if n:
             db_state_set("initial_load_done", "1")
-        db_state_set("migrated_bot5", "1")
+        db_state_set("migrated_bot6", "1")
         log.info("Из %s перенесено %d сообщений, роли, имена и настройки бесед", old_path, n)
     except Exception as e:
-        log.warning("migrate_from_bot5 (%s): %s", old_path, e)
+        log.warning("migrate_from_bot6 (%s): %s", old_path, e)
 
 
 # ============ Имена ============
@@ -989,11 +1008,6 @@ class PeerState:
         self.first_pending_ts = 0.0
         self.last_pending_ts = 0.0
         self.paused_until = 0.0
-        self.ctx_size = CONTEXT_SIZE
-        self.growing = False           # активный спор: контекст растёт на 1 с каждым сообщением
-        self.last_activity = 0.0       # время последнего сообщения людей
-        self.last_answer_ts = 0.0
-        self.last_interval = None      # время между двумя последними ответами бота
         self.chains = {}               # from_id -> [часть]: длинные сообщения без обращения подряд
         self.buffers = {}              # from_id -> {...}: /роль или «запомни», ждущие продолжения
 
@@ -1004,41 +1018,105 @@ def peer_state(peer_id):
     return PEERS[peer_id]
 
 
-def reset_context_size_if_quiet(st, t):
-    if st.last_activity and t - st.last_activity >= CONTEXT_RESET_MINUTES * 60:
-        st.ctx_size = CONTEXT_SIZE
-        st.growing = False
-        st.last_answer_ts = 0.0
-        st.last_interval = None
-
-
-def note_activity(peer_id, t=None):
-    """Новое сообщение людей: после тишины — контекст к исходному, в споре — +1."""
-    t = now() if t is None else t
-    st = peer_state(peer_id)
-    reset_context_size_if_quiet(st, t)
-    if st.growing:
-        st.ctx_size = min(st.ctx_size + 1, CONTEXT_SIZE_MAX)
-    st.last_activity = t
-
-
-def note_bot_answer(peer_id, t=None):
-    """Ответ бота: если время между ответами уменьшается — начался активный спор."""
-    t = now() if t is None else t
-    st = peer_state(peer_id)
-    if st.last_answer_ts:
-        interval = t - st.last_answer_ts
-        if st.last_interval is not None and interval < st.last_interval and not st.growing:
-            st.growing = True
-            log.info("peer=%s: активный спор, контекст растёт (сейчас %d)", peer_id, st.ctx_size)
-        st.last_interval = interval
-    st.last_answer_ts = t
+# ============ Размер контекста: /контекст, /автоконтекст, /сброс контекста ============
+# ctx_<peer>     — размер, заданный «/контекст N» (или «/сброс контекста N»);
+# autoctx_<peer> — размер, посчитанный «/автоконтекст» (действует поверх ctx_ до «/сброс контекста»).
+def context_setting(peer_id):
+    """(размер, откуда): 'авто', 'задан' или 'стандарт'."""
+    for key, source in (("autoctx", "авто"), ("ctx", "задан")):
+        value = _limit_get(f"{key}_{peer_id}", None)[0]
+        if value:
+            return value, source
+    return CONTEXT_SIZE, "стандарт"
 
 
 def context_size(peer_id):
-    st = peer_state(peer_id)
-    reset_context_size_if_quiet(st, now())
-    return st.ctx_size
+    return context_setting(peer_id)[0]
+
+
+def context_text(peer_id):
+    """«30 сообщений (стандарт)» / «120 сообщений (автоконтекст; без него — 50)»."""
+    size, source = context_setting(peer_id)
+    if source == "стандарт":
+        return f"{size} сообщений (стандарт)"
+    base = _limit_get(f"ctx_{peer_id}", None)[0] or CONTEXT_SIZE
+    if source == "авто":
+        return f"{size} сообщений (автоконтекст; после «/сброс контекста» — {base})"
+    return f"{size} сообщений (задан; стандарт {CONTEXT_SIZE})"
+
+
+def set_context(peer_id, key, value):
+    value = min(max(int(value), 1), CONTEXT_SIZE_MAX)
+    db_state_set(f"{key}_{peer_id}", f"{value}|{int(now())}")
+    return value
+
+
+def db_count_since(peer_id, start_ts, start_id=0, exclude_ids=()):
+    """Сколько сообщений беседы с start_ts (а при равном времени — с id ≥ start_id) до сейчас.
+    Служебные сообщения бота не считаются — как и в db_get_context."""
+    exclude_ids = list(exclude_ids) or [-1]
+    marks = ",".join("?" * len(exclude_ids))
+    return DB.execute(
+        f"SELECT COUNT(*) FROM messages WHERE peer_id=? AND id NOT IN ({marks}) "
+        f"AND (ts>? OR (ts=? AND id>=?)) AND {NOT_SYSTEM_SQL}",
+        (peer_id, *exclude_ids, start_ts, start_ts, start_id, SYSTEM_MARK + "%")).fetchone()[0]
+
+
+def find_stored_message(peer_id, msg):
+    """Пересланное сообщение или reply → (id, ts) этого сообщения в истории беседы или None.
+    Ищется по conversation_message_id (если оно из этой беседы), затем по автору и времени,
+    затем по автору и тексту."""
+    cmid, ts = msg.get("conversation_message_id"), msg.get("date")
+    from_id, text = msg.get("from_id"), (msg.get("text") or "").strip()
+    if cmid and msg.get("peer_id", peer_id) == peer_id:
+        row = DB.execute("SELECT id, ts FROM messages WHERE peer_id=? AND cmid=?",
+                         (peer_id, cmid)).fetchone()
+        if row and (not ts or abs(row[1] - ts) <= 60):
+            return row
+    if from_id and ts:
+        rows = DB.execute("SELECT id, ts, text FROM messages WHERE peer_id=? AND from_id=? AND ts=? "
+                          "ORDER BY id", (peer_id, from_id, ts)).fetchall()
+        for rid, rts, rtext in rows:
+            if not text or text in (rtext or ""):
+                return rid, rts
+        if rows:
+            return rows[0][0], rows[0][1]
+    if from_id and text:
+        row = DB.execute("SELECT id, ts FROM messages WHERE peer_id=? AND from_id=? AND text LIKE ? "
+                         "ORDER BY ts DESC, id DESC LIMIT 1",
+                         (peer_id, from_id, "%" + text[:200] + "%")).fetchone()
+        if row:
+            return row
+    return None
+
+
+AUTOCTX_UNITS = (("м", 60), ("ч", 3600), ("д", 86400), ("сут", 86400), ("нед", 7 * 86400))
+
+
+def parse_period(arg):
+    """«2 ч», «2ч», «30 мин», «1 день», «2,5 часа», «2» (часы) → секунды или None."""
+    m = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*([а-яё]*)\.?", (arg or "").strip().lower())
+    if not m:
+        return None
+    number, unit = float(m.group(1).replace(",", ".")), m.group(2)
+    if not unit:
+        return int(number * 3600) or None
+    if unit.startswith("мес"):
+        return None
+    for prefix, sec in AUTOCTX_UNITS:
+        if unit.startswith(prefix):
+            return int(number * sec) or None
+    return None
+
+
+def fmt_period(sec):
+    if sec % 86400 == 0:
+        return f"{sec // 86400} сут"
+    if sec % 3600 == 0:
+        return f"{sec // 3600} ч"
+    if sec >= 3600:
+        return f"{sec / 3600:.1f} ч".replace(".", ",")
+    return f"{max(sec // 60, 1)} мин"
 
 
 def is_paused(peer_id):
@@ -1271,11 +1349,16 @@ def format_line(from_id, is_bot, text, ts):
 
 
 def context_lines(rows):
-    """[(id, строка), ...] без пустых и служебных сообщений бота."""
+    """[(id, строка), ...] без пустых и служебных сообщений бота; из ответов бота убраны
+    рассуждения и приставка «Поиск по базе знаний не дал результата»."""
     out = []
     for rid, from_id, is_bot, text, ts, _images in rows:
         if not text or (is_bot and text.startswith(SYSTEM_MARK)):
             continue
+        if is_bot or from_id == BOT_GROUP_ID:
+            text = strip_bot_extras(text)
+            if not text:
+                continue
         out.append((rid, format_line(from_id, is_bot, text, ts)))
     return out
 
@@ -1302,16 +1385,17 @@ def compress_lines(previous_summary, lines):
         + (f"ПРЕЖНИЙ ПЕРЕСКАЗ:\n{previous_summary}\n\n" if previous_summary else "")
         + f"СООБЩЕНИЯ:\n{old}"
     )
-    summary = llm_call("Ты сжимаешь историю чата для памяти собеседника.", prompt,
-                       max_tokens=max(300, CONTEXT_SUMMARY_CHARS // 2))
+    with quiet_llm():
+        summary = llm_call("Ты сжимаешь историю чата для памяти собеседника.", prompt,
+                           max_tokens=max(300, CONTEXT_SUMMARY_CHARS // 2))
     return shorten(summary, CONTEXT_SUMMARY_CHARS)
 
 
 @traced
 def build_history(peer_id, rows, max_chars):
     """
-    История для запроса. Влезает в max_chars — как есть. Не влезает (в активном споре
-    контекст растёт) — старая часть сжимается в пересказ, а свежие сообщения идут
+    История для запроса. Влезает в max_chars — как есть. Не влезает (большой /контекст
+    или /автоконтекст) — старая часть сжимается в пересказ, а свежие сообщения идут
     дословно. Пересказ хранится в БД (ctxsum_<peer>) и дополняется, только когда
     свежая часть снова перестала помещаться, — LLM не вызывается на каждом ответе.
     """
@@ -1441,10 +1525,30 @@ def _rate_limit():
     _last_llm_call = time.time()
 
 
-def _llm_request(system, content, max_tokens):
-    """Один запрос к API: (ответ, finish_reason). Пишет в лог строку с расходом токенов."""
+THINK_RE = re.compile(r"^\s*<think>(.*?)</think>\s*", re.DOTALL)
+
+
+def extract_reasoning(message, answer):
+    """(ответ, рассуждение): рассуждение — из reasoning_content / reasoning (DeepSeek, OpenRouter
+    и т. п.) или из «<think>…</think>» в начале ответа (тогда из ответа оно убирается)."""
+    reasoning = None
+    extra = getattr(message, "model_extra", None) or {}
+    for name in ("reasoning_content", "reasoning"):
+        value = getattr(message, name, None) or extra.get(name)
+        if isinstance(value, str) and value.strip():
+            reasoning = value.strip()
+            break
+    m = THINK_RE.match(answer or "")
+    if m:
+        reasoning = reasoning or m.group(1).strip()
+        answer = answer[m.end():]
+    return (answer or "").strip(), reasoning
+
+
+def _llm_request(system, content, max_tokens, extra_body=None):
+    """Один запрос к API: (ответ, finish_reason, рассуждение). Пишет в лог строку с расходом токенов."""
     _rate_limit()
-    kwargs = {"extra_body": LLM_EXTRA_BODY} if LLM_EXTRA_BODY else {}
+    kwargs = {"extra_body": extra_body} if extra_body else {}
     t0 = time.time()
     resp = llm_client.chat.completions.create(
         model=MODEL_NAME,
@@ -1456,28 +1560,62 @@ def _llm_request(system, content, max_tokens):
         **kwargs,
     )
     choice = resp.choices[0]
-    answer = (getattr(choice.message, "content", None) or "").strip()
+    answer, reasoning_text = extract_reasoning(choice.message, getattr(choice.message, "content", None))
     finish = getattr(choice, "finish_reason", None)
     usage = getattr(resp, "usage", None)
     details = getattr(usage, "completion_tokens_details", None)
     reasoning = getattr(details, "reasoning_tokens", None)
-    log.info("LLM: %.1f с, finish=%s, токены: вход %s, выход %s%s (лимит %d), ответ %d символов",
-             time.time() - t0, finish, getattr(usage, "prompt_tokens", "?"),
-             getattr(usage, "completion_tokens", "?"),
-             f", из них рассуждение {reasoning}" if reasoning else "", max_tokens, len(answer))
+    log.info("LLM: %.1f с, finish=%s, рассуждения %s, токены: вход %s, выход %s%s (лимит %d), "
+             "ответ %d символов%s", time.time() - t0, finish, "вкл" if REASONING_ON else "выкл",
+             getattr(usage, "prompt_tokens", "?"), getattr(usage, "completion_tokens", "?"),
+             f", из них рассуждение {reasoning}" if reasoning else "", max_tokens, len(answer),
+             f", текст рассуждения {len(reasoning_text)} символов" if reasoning_text else "")
     if DEBUG_MODE:
-        log.debug("LLM system:\n%s\nLLM user:\n%s\nLLM ответ:\n%s", system,
-                  content if isinstance(content, str) else content[0]["text"], answer)
-    return answer, finish
+        log.debug("LLM system:\n%s\nLLM user:\n%s\nLLM рассуждение:\n%s\nLLM ответ:\n%s", system,
+                  content if isinstance(content, str) else content[0]["text"], reasoning_text, answer)
+    return answer, finish, reasoning_text
+
+
+def reasoning_body():
+    """Параметры, которые включают или выключают рассуждение модели (REASONING_ON/OFF_BODY)."""
+    if not REASONING_PARAM_OK:
+        return None
+    return REASONING_ON_BODY if REASONING_ON else REASONING_OFF_BODY
+
+
+def is_param_error(e):
+    """Похоже, что API не понял параметр запроса (400/422 или ошибка про thinking)."""
+    return getattr(e, "status_code", None) in (400, 422) or "thinking" in str(e).lower()
+
+
+def _request(system, content, max_tokens):
+    """Запрос с REASONING_*_BODY; если API отверг этот параметр — повтор без него, и до конца
+    работы бота он больше не передаётся (рассуждение тогда — как решит модель)."""
+    global REASONING_PARAM_OK
+    thinking = reasoning_body()
+    body = dict(LLM_EXTRA_BODY or {})
+    body.update(thinking or {})
+    try:
+        return _llm_request(system, content, max_tokens, body or None)
+    except Exception as e:
+        if not thinking or not is_param_error(e):
+            raise
+        log.warning("API отверг параметр %s (%s) — повтор без него", thinking, shorten(str(e), 200))
+        result = _llm_request(system, content, max_tokens, dict(LLM_EXTRA_BODY or {}) or None)
+        REASONING_PARAM_OK = False
+        log.warning("Параметр рассуждения больше не передаётся: модель рассуждает как решит сама; "
+                    "поправьте REASONING_ON_BODY / REASONING_OFF_BODY в настройках")
+        return result
 
 
 @traced
-def llm_call(system, user_text, max_tokens=MAX_TOKENS_DEFAULT, images=()):
+def llm_call(system, user_text, max_tokens=MAX_TOKENS_DEFAULT, images=(), retry_empty=True):
     """
     Запрос к LLM. Возвращает ответ или "" — тогда причина в LAST_LLM_ERROR.
+    Рассуждение модели (если она его вернула) добавляется в LLM_REASONINGS.
     Пустой ответ с finish_reason="length" — модель-«рассуждалка» потратила весь лимит
-    токенов на рассуждение (токены списаны, а текста нет): один повтор с большим лимитом.
-    Ошибка API с картинками — повтор без картинок.
+    токенов на рассуждение (токены списаны, а текста нет): если retry_empty — один повтор
+    с большим лимитом (у /мысль повтора нет). Ошибка API с картинками — повтор без картинок.
     """
     global LAST_LLM_ERROR
     LAST_LLM_ERROR = ""
@@ -1493,17 +1631,20 @@ def llm_call(system, user_text, max_tokens=MAX_TOKENS_DEFAULT, images=()):
         else:
             content = user_text
     try:
-        answer, finish = _llm_request(system, content, max_tokens)
+        answer, finish, reasoning = _request(system, content, max_tokens)
     except Exception as e:
         log.error("llm_call: %s", e)
         LAST_LLM_ERROR = f"ошибка API: {shorten(str(e), 300)}"
         if images:
             # модель или прокси не приняли картинки — пробуем хотя бы текстом
-            answer = llm_call(system, user_text + "\n\n(Картинки не удалось передать.)", max_tokens)
+            answer = llm_call(system, user_text + "\n\n(Картинки не удалось передать.)", max_tokens,
+                              retry_empty=retry_empty)
             if not answer:
                 LAST_LLM_ERROR = f"ошибка API: {shorten(str(e), 300)}; без картинок: {LAST_LLM_ERROR}"
             return answer
         return ""
+    if reasoning:
+        LLM_REASONINGS.append(reasoning)
     if answer:
         if finish == "length":
             log.warning("ответ обрезан лимитом %d токенов", max_tokens)
@@ -1511,7 +1652,7 @@ def llm_call(system, user_text, max_tokens=MAX_TOKENS_DEFAULT, images=()):
     if finish == "length":
         LAST_LLM_ERROR = (f"модель израсходовала весь лимит ({max_tokens} токенов) на рассуждение "
                           "и не успела написать ответ")
-        if EMPTY_ANSWER_RETRY_TOKENS and max_tokens < EMPTY_ANSWER_RETRY_TOKENS:
+        if retry_empty and EMPTY_ANSWER_RETRY_TOKENS and max_tokens < EMPTY_ANSWER_RETRY_TOKENS:
             log.warning("пустой ответ: %s — повтор с лимитом %d", LAST_LLM_ERROR, EMPTY_ANSWER_RETRY_TOKENS)
             answer = llm_call(system, user_text, EMPTY_ANSWER_RETRY_TOKENS, images)
             if not answer and LAST_LLM_ERROR.startswith("модель израсходовала"):
@@ -1524,15 +1665,105 @@ def llm_call(system, user_text, max_tokens=MAX_TOKENS_DEFAULT, images=()):
     return ""
 
 
+# ============ Режимы беседы: рассуждения, база знаний ============
+def reasoning_enabled(peer_id):
+    raw = db_state_get(f"reasoning_{peer_id}")
+    return REASONING_DEFAULT if raw is None else raw == "1"
+
+
+def rag_mode(peer_id):
+    raw = db_state_get(f"rag_{peer_id}")
+    return RAG_MODE_DEFAULT if raw is None else raw == "1"
+
+
+def chunks_limit(peer_id):
+    """Сколько найденных фрагментов базы знаний передавать модели (/лимит чанков)."""
+    return _limit_get(f"chunks_{peer_id}", RAG_TOP_K)[0]
+
+
+class with_reasoning:
+    """Ответ беседы: запросы к LLM внутри — с рассуждением или без (режим беседы),
+    LLM_REASONINGS собирает рассуждения всех запросов этого ответа."""
+
+    def __init__(self, peer_id):
+        self.on = reasoning_enabled(peer_id)
+
+    def __enter__(self):
+        global REASONING_ON
+        self.prev = REASONING_ON
+        REASONING_ON = self.on
+        LLM_REASONINGS.clear()
+        return self
+
+    def __exit__(self, *exc):
+        global REASONING_ON
+        REASONING_ON = self.prev
+        return False
+
+
+class quiet_llm:
+    """Вспомогательный запрос внутри ответа (сжатие истории): без рассуждения, и его
+    рассуждение (если модель всё же его вернула) в ответ не попадает."""
+
+    def __enter__(self):
+        global REASONING_ON
+        self.prev, self.n = REASONING_ON, len(LLM_REASONINGS)
+        REASONING_ON = False
+        return self
+
+    def __exit__(self, *exc):
+        global REASONING_ON
+        REASONING_ON = self.prev
+        del LLM_REASONINGS[self.n:]
+        return False
+
+
+class NoAnswer(Exception):
+    """produce() для llm_reply: ответа нет по понятной причине — служебное сообщение с этим текстом."""
+
+
+def reasoning_block():
+    """«#рассуждения#\n…\n#рассуждения#» — рассуждения модели за текущий ответ."""
+    text = "\n\n".join(r for r in LLM_REASONINGS if r)
+    if not text:
+        text = "(модель не вернула рассуждение)"
+    elif len(text) > REASONING_MAX_CHARS:
+        half = REASONING_MAX_CHARS // 2
+        text = f"{text[:half].rstrip()}\n[…сокращено {len(text) - 2 * half} символов…]\n{text[-half:].lstrip()}"
+    return f"{REASONING_MARK}\n{text}\n{REASONING_MARK}"
+
+
+REASONING_BLOCK_RE = re.compile(rf"^\s*{re.escape(REASONING_MARK)}.*?{re.escape(REASONING_MARK)}\s*",
+                                re.DOTALL)
+
+
+def strip_bot_extras(text):
+    """Ответ бота для истории: без блока рассуждения и без пометки «Поиск … не дал результата»
+    (иначе модель начинает подражать им в следующих ответах)."""
+    text = REASONING_BLOCK_RE.sub("", text or "")
+    if text.lstrip().startswith(REASONING_MARK):
+        return ""                  # первая часть длинного ответа: всё — рассуждение
+    if REASONING_MARK in text:     # следующая часть: конец рассуждения и начало ответа
+        text = text.split(REASONING_MARK, 1)[1]
+    text = text.strip()
+    if text.startswith(RAG_NO_RESULT_PREFIX):
+        text = text[len(RAG_NO_RESULT_PREFIX):].lstrip()
+    return text
+
+
 def clean_answer(text):
     """Убирает «Грань разумного:» в начале, если модель подписалась."""
     return re.sub(rf"^\s*(\[[^\]]*\]\s*)?({re.escape(BOT_NAME)}|Грань)\s*:\s*", "", text or "").strip()
 
 
 @traced
-def ask_gran(peer_id, requests, context_rows, images=()):
-    """Один запрос к LLM на одно или несколько обращений, накопившихся за BATCH_WAIT_SEC."""
+def ask_gran(peer_id, requests, context_rows, images=(), fragments=None):
+    """Один запрос к LLM на одно или несколько обращений, накопившихся за BATCH_WAIT_SEC.
+    fragments — найденные фрагменты базы знаний (режим «/раг вкл»): тогда ответ только по ним
+    или rag.NO_ANSWER, если ответа в них нет."""
     system = build_system_prompt(db_get_role(peer_id))
+    if fragments:
+        system += "\n\n" + rag.CHAT_RULES
     ctx = build_history(peer_id, context_rows, chars_limit(peer_id))
     log.debug("КОНТЕКСТ peer=%s:\n%s", peer_id, ctx)
 
@@ -1543,15 +1774,19 @@ def ask_gran(peer_id, requests, context_rows, images=()):
     else:
         task = (f"НОВЫЕ СООБЩЕНИЯ (их {len(requests)}, ответь на все одним сообщением, "
                 f"обращаясь к авторам по имени):\n{new}\n\n")
+    knowledge = f"ФРАГМЕНТЫ БАЗЫ ЗНАНИЙ:\n\n{fragments}\n\n" if fragments else ""
     prompt = (
-        "Ниже история чата (старые сообщения сверху, новые снизу) и новые "
+        "Ниже история чата (старые сообщения сверху, новые снизу)"
+        + (", фрагменты базы знаний" if fragments else "") + " и новые "
         "сообщения, на которые надо ответить.\n\n"
-        f"{history}{task}"
+        f"{history}{knowledge}{task}"
         + ("К запросу приложены картинки из новых сообщений и последних сообщений истории.\n\n"
            if images else "")
-        + "Ответь как Грань."
+        + ("Ответь как Грань, только по фрагментам базы знаний (с номерами фрагментов), "
+           f"или одним словом {rag.NO_ANSWER}." if fragments else "Ответь как Грань.")
     )
-    return clean_answer(llm_call(system, prompt, max_tokens=tokens_limit(peer_id), images=images))
+    max_tokens = max(RAG_MAX_TOKENS, tokens_limit(peer_id)) if fragments else tokens_limit(peer_id)
+    return clean_answer(llm_call(system, prompt, max_tokens=max_tokens, images=images))
 
 
 @traced
@@ -1664,7 +1899,9 @@ def parse_start_time(s, t=None):
 SPLIT_COMMANDS = {"роль", "запомни"}    # их текст может прийти несколькими сообщениями
 RESET_ROLE_RE = re.compile(r"(?:^|\s)/сбросить\s+роль\b", re.IGNORECASE)
 REMEMBER_RE = re.compile(r"\bгрань\b[\s,.:!—-]*запомни\b|(?:^|\s)/запомни\b", re.IGNORECASE)
-RAG_RE = re.compile(r"(?<![\w/])(/?)(раг|rag)(\+?)(?!\w)", re.IGNORECASE)
+RAG_RE = re.compile(r"(?<![\w/])(/?)(раг|rag)(?!\w)", re.IGNORECASE)
+RAG_MODE_RE = re.compile(r"(вкл(?:ючить|ючи)?|on|выкл(?:ючить|ючи)?|off)[\s.!]*", re.IGNORECASE)
+_ON_OFF = r"(?:\s*[:=]?\s*(вкл\w*|выкл\w*|on|off))?"
 _NUMBER = r"\d(?:[\d \u00a0\u2009\u202f]*\d)?(?:\s*(?:к|k|тыс\.?))?(?!\w)"   # 3000, 30 000, 30к, 2k, 3 тыс
 _LIMIT_ARG = r"(?:\s*[:=]?\s*(" + _NUMBER + r"|сброс|стандарт))?"
 COMMAND_PATTERNS = [
@@ -1677,20 +1914,35 @@ COMMAND_PATTERNS = [
     ("пересказ", re.compile(r"(?:^|\s)/пересказ\b(?:\s+(\d+))?(?:\s+(?:от|с)\s+(.+))?",
                             re.IGNORECASE | re.DOTALL)),
     ("мысль", re.compile(r"(?:^|\s)/мысль\b(?:\s+(подробно))?", re.IGNORECASE)),
+    ("лимит чанков", re.compile(r"(?:^|\s)/лимит\s+(?:чанков|фрагментов)\b" + _LIMIT_ARG, re.IGNORECASE)),
+    ("сброс контекста", re.compile(r"(?:^|\s)/сброс(?:ить)?\s+контекст[аы]?\b(?:\s*[:=]?\s*(\d+))?",
+                                   re.IGNORECASE)),
+    ("автоконтекст", re.compile(r"(?:^|\s)/авто-?\s*контекст\b(.*)", re.IGNORECASE)),
+    ("контекст", re.compile(r"(?:^|\s)/контекст\b(?:\s*[:=]?\s*(\d+|сброс|стандарт))?", re.IGNORECASE)),
+    ("рассуждения", re.compile(r"(?:^|\s)/рассуждени[яе]\b" + _ON_OFF, re.IGNORECASE)),
 ]
 
 
 def parse_rag(text, addressed=True):
-    """«Грань, РАГ вопрос» / «/раг вопрос» / «РАГ+ …» → (плюс, вопрос) или None.
+    """«Грань, РАГ вопрос» / «/раг вопрос» → ("раг", вопрос); «/раг вкл» / «/раг выкл» →
+    ("раг режим", True/False); иначе None.
     Без «/» слово должно быть написано заглавными («РАГ») или стоять сразу после «Грань,»,
     и сообщение должно быть обращением к боту — чтобы не срабатывать на случайное «раг»."""
     for m in RAG_RE.finditer(text):
         slash, word = m.group(1), m.group(2)
         after_name = bool(ADDRESS_PREFIX_RE.fullmatch(text[:m.start()])) and has_trigger(text[:m.start()])
         if slash or ((word.isupper() or after_name) and addressed):
-            query = re.sub(r"^[\s,.:;!?—-]+", "", text[m.end():]).strip()
-            return bool(m.group(3)), query
+            query = re.sub(r"^[\s,.:;!?+—-]+", "", text[m.end():]).strip()   # «РАГ+» — как «РАГ»
+            mode = RAG_MODE_RE.fullmatch(query)
+            if mode:
+                return ("раг режим", is_on(mode.group(1)))
+            return ("раг", query)
     return None
+
+
+def is_on(word):
+    """«вкл», «включить», «on» → True; «выкл», «off» → False."""
+    return word.lower().startswith(("вкл", "on"))
 
 
 def parse_command(text, addressed=True):
@@ -1709,7 +1961,7 @@ def parse_command(text, addressed=True):
         return ("запомни", text[m.end():].strip())
     rag_cmd = parse_rag(text, addressed)
     if rag_cmd:
-        return ("раг", rag_cmd)
+        return rag_cmd
     for name, rx in COMMAND_PATTERNS:
         m = rx.search(text)
         if not m:
@@ -1719,6 +1971,10 @@ def parse_command(text, addressed=True):
                            m.group(2).strip() if m.group(2) else None))
         if name == "мысль":
             return (name, bool(m.group(1)))
+        if name == "рассуждения":
+            return (name, is_on(m.group(1)) if m.group(1) else None)
+        if name == "автоконтекст":
+            return (name, m.group(1).strip() or None)
         return (name, m.group(1) if m.groups() else None)
     return None
 
@@ -1756,11 +2012,25 @@ HELP = [
      f"не отвечать {PAUSE_DEFAULT_MINUTES} мин (до {PAUSE_MAX_MINUTES}), потом ответить на всё "
      "накопившееся; «/пауза 0» — снять паузу"),
     ("забудь", "/забудь", "все", "начать контекст беседы с чистого листа (история в БД остаётся)"),
+    ("контекст", "/контекст N", "все",
+     f"сколько последних сообщений истории передавать модели (стандарт {CONTEXT_SIZE}, до "
+     f"{CONTEXT_SIZE_MAX}); «/контекст» — показать, «/контекст сброс» — к стандарту"),
+    ("автоконтекст", "/автоконтекст + пересланное сообщение (или reply на него)", "все",
+     "контекст — от этого сообщения до текущего (сообщение должно быть в истории этой беседы)"),
+    ("автоконтекст период", "/автоконтекст 2 ч (м, ч, д, нед)", "все",
+     "контекст — все сообщения за последний период (число считается по истории)"),
+    ("сброс контекста", "/сброс контекста [N]", "все",
+     "отменить автоконтекст: вернуться к заданному «/контекст» размеру (или стандарту); "
+     "с числом — сразу задать N"),
     ("раг", "«Грань, РАГ вопрос» или «/раг вопрос»", "все",
-     f"ответ строго по книгам из папки RAG (с источниками); если там ничего нет — "
+     f"разовый ответ строго по книгам из папки RAG (с источниками); если там ничего нет — "
      f"«{RAG_NOTHING_FOUND}», без выдумок; «/раг» без вопроса — что есть в базе знаний"),
-    ("раг+", "«Грань, РАГ+ вопрос» или «/раг+ вопрос»", "все",
-     f"то же, а после «{RAG_SEPARATOR}» — ещё и обычный ответ модели"),
+    ("раг режим", "/раг вкл, /раг выкл", "все",
+     "вкл — каждый ответ сначала ищется в базе знаний: нашлось — ответ только по фрагментам, "
+     f"не нашлось — «{RAG_NO_RESULT_PREFIX}» и обычный ответ; выкл — ответы только по истории"),
+    ("рассуждения", "/рассуждения вкл, /рассуждения выкл", "все",
+     f"вкл — модель рассуждает перед ответом, рассуждение — в начале сообщения между строками "
+     f"«{REASONING_MARK}»" + ("" if REASONING_DEFAULT else "; по умолчанию выключены")),
     ("запомни", "«Грань, запомни» + пересланные сообщения (или текст после «запомни»)",
      "админ" if REMEMBER_ADMIN_ONLY else "все",
      f"перезаписать {REMEMBER_FILE} в базе знаний и переиндексировать его"),
@@ -1774,12 +2044,20 @@ HELP = [
     ("лимит символов", "/лимит символов N / сброс", "админ",
      f"сколько символов истории передавать модели (стандарт {MAX_CONTEXT_CHARS}); "
      "что не влезло — сжимается в пересказ"),
+    ("лимит чанков", "/лимит чанков N / сброс", "админ",
+     f"сколько найденных фрагментов базы знаний (по ~{rag.CHUNK_CHARS} символов) передавать "
+     f"модели (стандарт {RAG_TOP_K}, до {RAG_TOP_K_MAX})"),
     ("сбросить лимит", "/сбросить лимит сообщений", "админ",
      f"обнулить дневной лимит ответов ({DAILY_MESSAGE_LIMIT} в сутки)"),
-    ("стоп", f"«{STOP_PHRASE.capitalize()}»", "все", "остановить бота"),
+    ("стоп", f"«{STOP_PHRASE.capitalize()}»", "админ",
+     "остановить бота" + ("; или «0» и Enter в терминале, где запущен бот" if TERMINAL_STOP else "")),
 ]
-ADMIN_COMMANDS = {"лимит токенов", "лимит символов", "сбросить лимит"}
+ADMIN_COMMANDS = {"лимит токенов", "лимит символов", "лимит чанков", "сбросить лимит", "стоп"}
 LLM_COMMANDS = {"пересказ", "мысль", "перескажи", "раг"}   # на паузе откладываются, расходуют лимит
+
+
+def on_off(flag):
+    return "включены" if flag else "выключены"
 
 
 def help_text(peer_id):
@@ -1790,14 +2068,18 @@ def help_text(peer_id):
     lines += [
         "",
         "Админ — админ или создатель беседы (боту нужны права админа в беседе); "
-        "в личных сообщениях собеседнику доступны все команды.",
+        "в личных сообщениях собеседнику доступны все команды, кроме остановки бота "
+        "(её — только ADMIN_IDS из .env).",
         "",
         "Сейчас в этой беседе:",
         f"• лимит токенов ответа: {tokens_limit(peer_id)}" + (
             f" (до {datetime.fromtimestamp(tokens_reset_at(peer_id)):%H:%M}, потом {MAX_TOKENS_DEFAULT})"
             if tokens_reset_at(peer_id) else ""),
         f"• лимит символов истории: {chars_limit(peer_id)}",
-        f"• контекст: {context_size(peer_id)} сообщений (обычно {CONTEXT_SIZE})",
+        f"• контекст: {context_text(peer_id)}",
+        f"• база знаний в ответах (/раг вкл): {'да' if rag_mode(peer_id) else 'нет'}; "
+        f"фрагментов в запрос: до {chunks_limit(peer_id)}",
+        f"• рассуждения: {on_off(reasoning_enabled(peer_id))}",
         "• ответов сегодня: " + (f"{st['count']} из {DAILY_MESSAGE_LIMIT}" if DAILY_MESSAGE_LIMIT > 0
                                  else f"{st['count']} (без лимита)"),
     ]
@@ -1815,6 +2097,13 @@ def needs_admin(cmd):
     return name == "пересказ" and (arg[0] or SUMMARY_DEFAULT_COUNT) > SUMMARY_FREE_MAX
 
 
+def can_stop(peer_id, user_id):
+    """Остановить бота из чата: ADMIN_IDS или админ беседы (в личке — только ADMIN_IDS)."""
+    if user_id in ADMIN_IDS:
+        return True
+    return not is_private(peer_id) and is_admin(peer_id, user_id)
+
+
 @traced
 def run_command(req):
     """Выполняет команду. Служебные — сразу; требующие LLM на паузе ждут её конца."""
@@ -1822,10 +2111,14 @@ def run_command(req):
     peer_id, message = req.peer_id, req.message
     name, arg = req.command
 
-    if needs_admin(req.command) and not is_admin(peer_id, req.from_id):
+    allowed = can_stop(peer_id, req.from_id) if name == "стоп" else (
+        not needs_admin(req.command) or is_admin(peer_id, req.from_id))
+    if not allowed:
         what = (f"Пересказ больше {SUMMARY_FREE_MAX} сообщений доступен" if name == "пересказ"
-                else "Эта команда доступна")
-        send_system(peer_id, f"{what} только админу беседы.", reply_to_msg=message)
+                else "Остановить бота может" if name == "стоп" else "Эта команда доступна")
+        log.info("peer=%s: команда «%s» от %s отклонена — не админ", peer_id, name, req.from_id)
+        send_system(peer_id, f"{what} только админ{'у' if name != 'стоп' else ''} беседы.",
+                    reply_to_msg=message)
         return
 
     if name in LLM_COMMANDS:
@@ -1837,7 +2130,7 @@ def run_command(req):
 
     if name == "стоп":
         vk_send(peer_id, "Останавливаюсь.", reply_to_msg=message)
-        log.info("Команда остановки от peer=%s", peer_id)
+        log.info("Команда остановки от %s в peer=%s", req.from_id, peer_id)
         db_state_set("stopped_at", int(now()))
         STOP_REQUESTED = True
     elif name == "роль":
@@ -1868,12 +2161,32 @@ def run_command(req):
         send_system(peer_id, help_text(peer_id), reply_to_msg=message)
     elif name == "пауза":
         cmd_pause(req, arg)
+    elif name == "контекст":
+        cmd_context(req, arg)
+    elif name == "автоконтекст":
+        cmd_autocontext(req, arg)
+    elif name == "сброс контекста":
+        cmd_reset_context(req, arg)
+    elif name == "раг режим":
+        db_state_set(f"rag_{peer_id}", "1" if arg else "0")
+        log.info("peer=%s: режим базы знаний %s (от %s)", peer_id, "вкл" if arg else "выкл", req.from_id)
+        send_system(peer_id, (f"Режим базы знаний включён: каждый ответ сначала ищется в базе знаний "
+                              f"(до {chunks_limit(peer_id)} фрагментов). Нашлось — отвечаю только по "
+                              f"фрагментам, не нашлось — пишу «{RAG_NO_RESULT_PREFIX}» и отвечаю как "
+                              "обычно. Выключить: «/раг выкл».") if arg else
+                    "Режим базы знаний выключен: отвечаю только по истории беседы. Разовый вопрос "
+                    "к базе знаний — «/раг вопрос».", reply_to_msg=message)
+    elif name == "рассуждения":
+        cmd_reasoning(req, arg)
     elif name == "лимит токенов":
         cmd_limit(req, arg, "tokens", "Лимит выходных токенов", MAX_TOKENS_DEFAULT,
                   MAX_TOKENS_CAP, tokens_limit)
     elif name == "лимит символов":
         cmd_limit(req, arg, "chars", "Лимит символов истории", MAX_CONTEXT_CHARS,
                   MAX_CONTEXT_CHARS_CAP, chars_limit)
+    elif name == "лимит чанков":
+        cmd_limit(req, arg, "chunks", "Лимит фрагментов базы знаний", RAG_TOP_K,
+                  RAG_TOP_K_MAX, chunks_limit)
     elif name == "сбросить лимит":
         db_state_del(daily_key(peer_id))
         send_system(peer_id, f"Дневной лимит сообщений сброшен: 0 из {DAILY_MESSAGE_LIMIT}.",
@@ -1892,17 +2205,127 @@ def cmd_pause(req, arg):
                              "на всё, что накопится.", reply_to_msg=req.message)
 
 
-def cmd_limit(req, arg, key, title, default, cap, getter):
-    """/лимит токенов и /лимит символов: без числа — показать, «сброс» — к стандарту."""
+def context_note(peer_id, value):
+    """Предупреждение, если столько сообщений не влезет в лимит символов истории."""
+    rows = db_get_context(peer_id, value)
+    size = _size(context_lines(rows))
+    if size > chars_limit(peer_id):
+        return (f" Сейчас это ~{size} символов — больше лимита истории ({chars_limit(peer_id)}): "
+                "старая часть будет сжиматься в пересказ (поднять лимит: «/лимит символов N», админ).")
+    return ""
+
+
+def cmd_context(req, arg):
+    """/контекст — показать; /контекст N — задать; /контекст сброс — к стандарту."""
     peer_id = req.peer_id
+    if arg is None:
+        send_system(peer_id, f"Контекст: {context_text(peer_id)}. Изменить: «/контекст N», "
+                             "по пересланному сообщению или за период: «/автоконтекст», "
+                             "вернуть стандарт: «/контекст сброс».", reply_to_msg=req.message)
+        return
+    if not arg.isdigit():
+        db_state_del(f"ctx_{peer_id}")
+        db_state_del(f"autoctx_{peer_id}")
+        log.info("peer=%s: контекст возвращён к стандарту (от %s)", peer_id, req.from_id)
+        send_system(peer_id, f"Контекст возвращён к стандарту: {CONTEXT_SIZE} сообщений.",
+                    reply_to_msg=req.message)
+        return
+    value = set_context(peer_id, "ctx", int(arg))
+    db_state_del(f"autoctx_{peer_id}")
+    log.info("peer=%s: контекст = %d (от %s)", peer_id, value, req.from_id)
+    send_system(peer_id, f"Контекст: {value} последних сообщений"
+                + (f" (максимум {CONTEXT_SIZE_MAX})" if int(arg) > CONTEXT_SIZE_MAX else "")
+                + "." + context_note(peer_id, value), reply_to_msg=req.message)
+
+
+def cmd_autocontext(req, arg):
+    """/автоконтекст + пересланное/reply — от этого сообщения; /автоконтекст 2 ч — за период."""
+    peer_id, message = req.peer_id, req.message
+    # сама команда тоже считается: в следующем ответе история — ровно от пересланного до неё
+    targets = list(message.get("fwd_messages") or [])
+    if message.get("reply_message"):
+        targets.append(message["reply_message"])
+    if arg:
+        period = parse_period(arg)
+        if period is None:
+            send_system(peer_id, "Не понял период. Примеры: «/автоконтекст 2 ч», «/автоконтекст 30 мин», "
+                                 "«/автоконтекст 1 д».", reply_to_msg=message)
+            return
+        start = int(now()) - period
+        count = db_count_since(peer_id, start)
+        what = f"за последние {fmt_period(period)}"
+    elif targets:
+        found = [f for f in (find_stored_message(peer_id, t) for t in targets) if f]
+        if not found:
+            send_system(peer_id, "Этого сообщения нет в истории беседы — автоконтекст работает только "
+                                 "с сообщениями этого чата. Можно задать период: «/автоконтекст 2 ч» "
+                                 "или число: «/контекст 50».", reply_to_msg=message)
+            return
+        rid, ts = min(found, key=lambda f: (f[1], f[0]))       # самое раннее из пересланных
+        count = db_count_since(peer_id, ts, start_id=rid)
+        what = f"от сообщения {fmt_ts(ts)}"
+    else:
+        send_system(peer_id, "Автоконтекст: перешлите сообщение из этой беседы (или ответьте на него) "
+                             "с командой «/автоконтекст» — контекст будет от него до текущего; "
+                             "«/автоконтекст 2 ч» — за последние 2 часа. Сейчас: "
+                             f"{context_text(peer_id)}.", reply_to_msg=message)
+        return
+    if count < 1:
+        send_system(peer_id, f"{what.capitalize()} сообщений в истории нет — контекст не изменён "
+                             f"({context_text(peer_id)}).", reply_to_msg=message)
+        return
+    value = set_context(peer_id, "autoctx", count)
+    log.info("peer=%s: автоконтекст %s — %d сообщений (поставлено %d, от %s)", peer_id, what, count,
+             value, req.from_id)
+    send_system(peer_id, f"Автоконтекст: {what} — {count} сообщений, контекст {value}"
+                + (f" (больше {CONTEXT_SIZE_MAX} не ставится)" if count > CONTEXT_SIZE_MAX else "")
+                + "." + context_note(peer_id, value) + " Вернуть прежний: «/сброс контекста».",
+                reply_to_msg=message)
+
+
+def cmd_reset_context(req, arg):
+    """/сброс контекста — отменить автоконтекст; /сброс контекста N — сразу задать N."""
+    peer_id = req.peer_id
+    db_state_del(f"autoctx_{peer_id}")
+    db_state_del(f"ctxsum_{peer_id}")
+    if arg:
+        set_context(peer_id, "ctx", int(arg))
+    log.info("peer=%s: сброс контекста%s (от %s)", peer_id, f" до {arg}" if arg else "", req.from_id)
+    send_system(peer_id, f"Контекст сброшен: {context_text(peer_id)}.", reply_to_msg=req.message)
+
+
+def cmd_reasoning(req, arg):
+    """/рассуждения вкл | выкл; без аргумента — показать."""
+    peer_id = req.peer_id
+    if arg is None:
+        send_system(peer_id, f"Рассуждения {on_off(reasoning_enabled(peer_id))}. Изменить: "
+                             "«/рассуждения вкл» или «/рассуждения выкл».", reply_to_msg=req.message)
+        return
+    db_state_set(f"reasoning_{peer_id}", "1" if arg else "0")
+    log.info("peer=%s: рассуждения %s (от %s)", peer_id, "вкл" if arg else "выкл", req.from_id)
+    note = ""
+    if arg and not REASONING_PARAM_OK:
+        note = (" (API отверг параметр включения рассуждения — модель рассуждает как решит сама, "
+                "показываю то, что она вернёт)")
+    send_system(peer_id, (f"Рассуждения включены: модель рассуждает перед ответом, рассуждение — в "
+                          f"начале сообщения между строками «{REASONING_MARK}»{note}. Рассуждение "
+                          "расходует токены — если ответ не успевает дописаться, поднимите "
+                          "«/лимит токенов».") if arg else
+                "Рассуждения выключены.", reply_to_msg=req.message)
+
+
+def cmd_limit(req, arg, key, title, default, cap, getter):
+    """/лимит токенов, символов, чанков: без числа — показать, «сброс» — к стандарту."""
+    peer_id = req.peer_id
+    word = {"tokens": "токенов", "chars": "символов", "chunks": "чанков"}[key]
     if arg is None:
         current = getter(peer_id)
         reset_at = tokens_reset_at(peer_id) if key == "tokens" else None
         when = (f" До {datetime.fromtimestamp(reset_at):%H:%M} — потом снова {default}."
                 if reset_at else "")
         send_system(peer_id, f"{title}: {current} (стандарт {default}).{when} "
-                             f"Изменить: «/лимит {'токенов' if key == 'tokens' else 'символов'} "
-                             "N», вернуть стандарт: «… сброс».", reply_to_msg=req.message)
+                             f"Изменить: «/лимит {word} N», вернуть стандарт: «… сброс».",
+                    reply_to_msg=req.message)
         return
     number = parse_limit_value(arg)
     if number is None:
@@ -1918,6 +2341,9 @@ def cmd_limit(req, arg, key, title, default, cap, getter):
         reset_at = datetime.fromtimestamp(now() + TOKEN_LIMIT_RESET_MINUTES * 60)
         note = (f" В {reset_at:%H:%M} (через {TOKEN_LIMIT_RESET_MINUTES} мин) вернётся к "
                 f"стандарту {default}.")
+    if key == "chunks":
+        note = (f" Это до ~{value * rag.CHUNK_CHARS} символов книг в запросе "
+                f"(предохранитель — {RAG_MAX_CONTEXT_CHARS}).")
     send_system(peer_id, f"{title}: {value}." + (f" (максимум {cap})" if number > cap else "")
                 + note, reply_to_msg=req.message)
 
@@ -1927,28 +2353,35 @@ def failure_text(fail_text):
     reason = LAST_LLM_ERROR or "модель не дала ответа"
     hint = ""
     if "лимит" in reason and "рассуждение" in reason:
-        hint = (" Можно поднять лимит: «/лимит токенов 4000» (админ) или задать в настройках "
-                "LLM_EXTRA_BODY, отключающий рассуждение.")
+        hint = (" Можно поднять лимит: «/лимит токенов 4000» (админ)"
+                + (" или выключить рассуждения: «/рассуждения выкл»." if REASONING_ON else "."))
     return f"{fail_text} Причина: {reason}.{hint}"
 
 
 def llm_reply(req, produce, fail_text):
     """Ответ, на который нужен LLM: проверка дневного лимита, генерация, отправка, учёт.
     Если ответа нет — служебное сообщение с причиной: оно не попадает в контекст модели и не
-    считается в дневном лимите (токены за неудачный запрос при этом могли быть списаны)."""
+    считается в дневном лимите (токены за неудачный запрос при этом могли быть списаны).
+    Рассуждения включены (/рассуждения вкл) — в начале ответа блок «#рассуждения#»."""
     global LAST_LLM_ERROR
     if daily_limit_reached(req.peer_id):
         send_system(req.peer_id, LIMIT_REACHED_TEXT, reply_to_msg=req.message)
         return False
     LAST_LLM_ERROR = ""
-    answer = produce()
+    with with_reasoning(req.peer_id) as r:
+        try:
+            answer, failure = produce(), None
+        except NoAnswer as e:
+            answer, failure = "", str(e)
+        if not answer and failure is None:
+            failure = failure_text(fail_text)
+        block = reasoning_block() if r.on and (answer or LLM_REASONINGS) else ""
     if not answer:
-        log.warning("peer=%s: %s", req.peer_id, failure_text(fail_text))
-        send_system(req.peer_id, failure_text(fail_text), reply_to_msg=req.message)
+        log.warning("peer=%s: %s", req.peer_id, failure)
+        send_system(req.peer_id, failure + (f"\n\n{block}" if block else ""), reply_to_msg=req.message)
         return False
-    vk_send(req.peer_id, answer, reply_to_msg=req.message)
+    vk_send(req.peer_id, f"{block}\n\n{answer}" if block else answer, reply_to_msg=req.message)
     count_answer(req.peer_id)
-    note_bot_answer(req.peer_id)
     return True
 
 
@@ -1962,14 +2395,16 @@ def run_llm_command(req):
                   "Не получилось пересказать.")
     elif name == "мысль":
         def produce():
-            ask = lambda system, prompt: llm_call(system, prompt, max_tokens=tokens_limit(peer_id))
+            # без повтора с большим лимитом: короткий ответ задаёт промпт («Пиши кратко»)
+            ask = lambda system, prompt: llm_call(system, prompt, max_tokens=tokens_limit(peer_id),
+                                                  retry_empty=False)
             steps = FILOSOF.generate(ask)
             return filosof.format_thought(steps, detailed=arg) if steps["answer"] else ""
         llm_reply(req, produce, "Мысль не родилась — попробуйте позже.")
     elif name == "пересказ":
         cmd_summary(req, *arg)
     elif name == "раг":
-        cmd_rag(req, *arg)
+        cmd_rag(req, arg)
 
 
 # ============ База знаний ============
@@ -2002,7 +2437,7 @@ def sync_kb():
     return kb
 
 
-def rag_status_text(kb):
+def rag_status_text(kb, peer_id):
     st = kb.stats()
     lines = [f"База знаний (папка {os.path.basename(RAG_DIR)} рядом с ботом): книг {st['ok']}, "
              f"фрагментов {st['chunks']}" + (f", не прочитано файлов: {len(st['errors'])}" if st["errors"] else "")
@@ -2012,15 +2447,26 @@ def rag_status_text(kb):
         lines.append(f"• {path} — «{title}», " + (f"не прочитан: {error}" if error else f"фрагментов {chunks}"))
     if len(books) > 30:
         lines.append(f"… и ещё {len(books) - 30}")
-    lines.append("Спросить: «Грань, РАГ вопрос» (только по книгам) или «Грань, РАГ+ вопрос» "
-                 f"(по книгам, а после «{RAG_SEPARATOR}» — ответ модели).")
+    lines.append(f"Режим базы знаний в этой беседе: {'включён' if rag_mode(peer_id) else 'выключен'}, "
+                 f"фрагментов в запрос — до {chunks_limit(peer_id)}.")
+    lines.append("Разовый вопрос: «Грань, РАГ вопрос» или «/раг вопрос» (только по книгам). "
+                 "«/раг вкл» — все ответы с учётом базы знаний, «/раг выкл» — только по истории.")
     return "\n".join(lines)
 
 
+def kb_search(peer_id, query):
+    """Найденные фрагменты (не больше /лимит чанков). Ошибку базы знаний пробрасывает."""
+    k = chunks_limit(peer_id)
+    hits = sync_kb().search(query, k=k) if query.strip() else []
+    log.info("peer=%s: поиск в базе знаний «%s» — найдено фрагментов: %d (лимит %d)", peer_id,
+             shorten(query, 100), len(hits), k)
+    return hits
+
+
 @traced
-def cmd_rag(req, plus, query):
-    """«РАГ вопрос»: ответ строго по найденным фрагментам книг; ничего не нашлось — служебное
-    сообщение без запроса к LLM. «РАГ+»: после «---» — ещё и обычный ответ модели."""
+def cmd_rag(req, query):
+    """«/раг вопрос»: разовый ответ строго по найденным фрагментам книг; ничего не нашлось —
+    служебное сообщение «В базе знаний ничего не нашлось.», без выдумок."""
     peer_id = req.peer_id
     if not query:
         query = quoted_content(req.message)[0].strip()
@@ -2031,52 +2477,56 @@ def cmd_rag(req, plus, query):
         send_system(peer_id, f"База знаний недоступна: {e}", reply_to_msg=req.message)
         return
     if not query:
-        send_system(peer_id, rag_status_text(kb), reply_to_msg=req.message)
+        send_system(peer_id, rag_status_text(kb, peer_id), reply_to_msg=req.message)
         return
-    if daily_limit_reached(peer_id):
-        send_system(peer_id, LIMIT_REACHED_TEXT, reply_to_msg=req.message)
-        return
-    hits = kb.search(query)
-    log.info("peer=%s: РАГ%s «%s» — найдено фрагментов: %d", peer_id, "+" if plus else "",
-             shorten(query, 100), len(hits))
-    max_tokens = max(RAG_MAX_TOKENS, tokens_limit(peer_id))
-    answer = None
-    if hits:
+
+    def produce():
+        hits = kb_search(peer_id, query)
+        if not hits:
+            raise NoAnswer(RAG_NOTHING_FOUND)
         system, prompt = rag.build_prompt(query, hits, RAG_MAX_CONTEXT_CHARS)
-        raw = llm_call(system, prompt, max_tokens=max_tokens)
+        raw = llm_call(system, prompt, max_tokens=max(RAG_MAX_TOKENS, tokens_limit(peer_id)))
         if not raw:
-            send_system(peer_id, failure_text("Не получилось ответить по базе знаний."),
-                        reply_to_msg=req.message)
-            return
+            return ""
         answer = rag.parse_answer(raw, hits)
         if answer is None:
             log.info("peer=%s: во фрагментах ответа нет (%s)", peer_id, rag.NO_ANSWER)
-    if answer is None:
-        send_system(peer_id, RAG_NOTHING_FOUND, reply_to_msg=req.message)
-    if not plus:
+            raise NoAnswer(RAG_NOTHING_FOUND)
+        return answer
+
+    llm_reply(req, produce, "Не получилось ответить по базе знаний.")
+
+
+def rag_query(requests):
+    """Текст для поиска в базе знаний: новые сообщения без обращения «Грань,»."""
+    return "\n".join(ADDRESS_PREFIX_RE.sub("", r.text, count=1) for r in requests).strip()
+
+
+@traced
+def rag_mode_answer(peer_id, requests, ctx_rows, images):
+    """
+    Режим «/раг вкл» — последовательная генерация:
+    1) поиск в базе знаний по новым сообщениям (не больше /лимит чанков фрагментов);
+    2) нашлось — ответ только по фрагментам (с номерами и источниками);
+    3) не нашлось или во фрагментах ответа нет (модель ответила НЕТ_ОТВЕТА) —
+       «Поиск по базе знаний не дал результата.» и обычный ответ по истории беседы.
+    """
+    try:
+        hits = kb_search(peer_id, rag_query(requests))
+    except Exception as e:
+        log.exception("база знаний: %s — отвечаю без неё", e)
+        hits = []
+    if hits:
+        fragments, used = rag.format_fragments(hits, RAG_MAX_CONTEXT_CHARS)
+        raw = ask_gran(peer_id, requests, ctx_rows, images, fragments=fragments)
+        if not raw:
+            return ""
+        answer = rag.parse_answer(raw, hits[:used])
         if answer:
-            vk_send(peer_id, answer, reply_to_msg=req.message)
-            count_answer(peer_id)
-            note_bot_answer(peer_id)
-        return
-    extra = rag_free_answer(peer_id, query, max_tokens)
-    if not extra and not answer:
-        send_system(peer_id, failure_text("Не получилось сформулировать ответ."), reply_to_msg=req.message)
-        return
-    if answer:
-        text = f"{answer}\n\n{RAG_SEPARATOR}\n" + (extra or failure_text("Ответ модели не получился."))
-    else:
-        text = f"{RAG_SEPARATOR}\n{extra}"
-    vk_send(peer_id, text, reply_to_msg=req.message)
-    count_answer(peer_id)
-    note_bot_answer(peer_id)
-
-
-def rag_free_answer(peer_id, query, max_tokens):
-    """РАГ+: обычный ответ модели (с ролью беседы), без базы знаний."""
-    system = build_system_prompt(db_get_role(peer_id))
-    prompt = f"Ответь на вопрос своими знаниями.\n\nВОПРОС: {query}"
-    return clean_answer(llm_call(system, prompt, max_tokens=max_tokens))
+            return answer
+        log.info("peer=%s: во фрагментах ответа нет (%s) — обычный ответ", peer_id, rag.NO_ANSWER)
+    answer = ask_gran(peer_id, requests, ctx_rows, images)
+    return f"{RAG_NO_RESULT_PREFIX}\n\n{answer}" if answer else ""
 
 
 def remember_content(req, text_arg):
@@ -2167,8 +2617,11 @@ def answer_batch(peer_id, requests):
 
     def produce():
         forget_ts = int(db_state_get(f"forget_{peer_id}", 0))
-        since = int(now()) - CONTEXT_MEMORY_HOURS * 3600 if CONTEXT_MEMORY_HOURS else None
-        ctx_rows = db_get_context(peer_id, context_size(peer_id), since_ts=since,
+        size, source = context_setting(peer_id)
+        # размер задан /контекст или /автоконтекст — берём ровно столько, без CONTEXT_MEMORY_HOURS
+        since = (int(now()) - CONTEXT_MEMORY_HOURS * 3600
+                 if CONTEXT_MEMORY_HOURS and source == "стандарт" else None)
+        ctx_rows = db_get_context(peer_id, size, since_ts=since,
                                   min_rows=CONTEXT_MIN_MESSAGES, exclude_ids=exclude,
                                   after_ts=forget_ts)
         # картинки: из новых сообщений, затем из самых свежих сообщений истории
@@ -2177,6 +2630,8 @@ def answer_batch(peer_id, requests):
             if len(images) >= MAX_IMAGES_PER_REQUEST:
                 break
             images.extend(row[5])
+        if rag_mode(peer_id):
+            return rag_mode_answer(peer_id, requests, ctx_rows, images)
         return ask_gran(peer_id, requests, ctx_rows, images)
 
     if len(requests) > 1:
@@ -2205,7 +2660,6 @@ def handle_message(message):
     if is_private(peer_id) and not ALLOW_PRIVATE_MESSAGES:
         return  # в личке бот молчит, пока это не разрешено настройкой
 
-    note_activity(peer_id, now())
     st = peer_state(peer_id)
     part = {"rowid": rowid, "text": full_text, "images": images, "ts": ts, "len": len(text),
             "added": now()}
@@ -2265,9 +2719,10 @@ def handle_event(event):
 
 # ============ Main ============
 def load_env():
-    """.env рядом с ботом, затем в текущей папке, затем от bot5 (если переходим с него)."""
+    """.env рядом с ботом, затем в текущей папке, затем от bot6 и bot5 (если переходим с них)."""
     from dotenv import load_dotenv
-    for path in (os.path.join(BOT_DIR, ".env"), None, os.path.join(BOT_DIR, "..", "bot5", ".env")):
+    for path in (os.path.join(BOT_DIR, ".env"), None, os.path.join(BOT_DIR, "..", "bot6", ".env"),
+                 os.path.join(BOT_DIR, "..", "bot5", ".env")):
         if path is None:
             load_dotenv()
         elif os.path.exists(path):
@@ -2287,7 +2742,7 @@ def init():
     VK_USER_TOKEN = os.getenv("VK_USER_TOKEN") or None
     ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS") or "")}
     DB = db_init(DB_PATH)
-    migrate_from_bot5()
+    migrate_from_bot6()
     if not os.path.exists(role_file_path()):
         log.info("Файла роли %s нет — роль по умолчанию из DEFAULT_ROLE", role_file_path())
     default_role()
@@ -2310,6 +2765,36 @@ def _graceful_signal(signum, frame):
     STOP_REQUESTED = True
 
 
+def terminal_stop_listener(stream=None):
+    """Поток-демон (TERMINAL_STOP): «0» + Enter в терминале, где запущен бот, — остановка,
+    как «Грань, стоп машина». Ввода нет (systemd, nohup, перенаправление из файла или
+    /dev/null) — поток просто завершается. Под bot7_server.py бот читает терминал сервера."""
+    global STOP_REQUESTED
+    stream = stream or sys.stdin
+    try:
+        while not STOP_REQUESTED:
+            line = stream.readline()
+            if not line:
+                log.debug("терминал: ввод закрыт — остановка «0» недоступна")
+                return
+            if line.strip() == "0":
+                log.info("Команда остановки из терминала («0»)")
+                STOP_REQUESTED = True
+                return
+            if line.strip():
+                log.info("Терминал: для остановки бота введите 0 и нажмите Enter")
+    except Exception as e:      # stdin закрыт или недоступен
+        log.debug("терминал: %s — остановка «0» недоступна", e)
+
+
+def start_terminal_stop():
+    if sys.stdin is None or getattr(sys.stdin, "closed", True):
+        return None
+    t = threading.Thread(target=terminal_stop_listener, name="terminal-stop", daemon=True)
+    t.start()
+    return t
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Бот «Грань» для чата сообщества ВКонтакте")
     ap.add_argument("--debug", action="store_true",
@@ -2317,7 +2802,9 @@ def parse_args(argv=None):
     ap.add_argument("--log-file", help="писать лог ещё и в этот файл")
     ap.add_argument("--restart-after-hours", type=float, default=0,
                     help=f"проработав столько часов, выйти с кодом {RESTART_EXIT_CODE} для перезапуска "
-                         "(его делает bot6_server.py); выход — когда никто не ждёт ответа")
+                         "(его делает bot7_server.py); выход — когда никто не ждёт ответа")
+    ap.add_argument("--no-terminal-stop", action="store_true",
+                    help="не читать терминал (без остановки по «0» + Enter)")
     args = ap.parse_args(argv)
     args.debug = args.debug or os.getenv("BOT_DEBUG", "").strip().lower() in ("1", "true", "yes", "да")
     return args
@@ -2335,7 +2822,9 @@ def main(argv=None):
     started = time.time()
     longpoll = init()
     load_history()
-    log.info("Слушаем Long Poll... (для остановки: '%s')%s%s", STOP_PHRASE,
+    terminal = TERMINAL_STOP and not args.no_terminal_stop and start_terminal_stop()
+    log.info("Слушаем Long Poll... (для остановки: '%s' от админа%s)%s%s", STOP_PHRASE,
+             " или 0 + Enter в терминале" if terminal else "",
              " [подробный лог]" if args.debug else "",
              f" [перезапуск через {args.restart_after_hours:g} ч]" if args.restart_after_hours else "")
 

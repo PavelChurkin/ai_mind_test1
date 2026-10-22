@@ -1,16 +1,17 @@
-# bot6_server.py — серверный запуск bot6: перезапуск раз в неделю с очисткой логов
+# bot7_server.py — серверный запуск bot7: перезапуск раз в неделю с очисткой логов
 #
-#   python bot6_server.py                     # перезапуск раз в 7 суток, лог — logs/bot6.log
-#   python bot6_server.py --restart-days 3    # раз в 3 суток
-#   python bot6_server.py --debug             # бот с подробным логом
+#   python bot7_server.py                     # перезапуск раз в 7 суток, лог — logs/bot7.log
+#   python bot7_server.py --restart-days 3    # раз в 3 суток
+#   python bot7_server.py --debug             # бот с подробным логом
 #
 # Как работает:
-#   * запускает bot6.py отдельным процессом с --log-file и --restart-after-hours;
+#   * запускает bot7.py отдельным процессом с --log-file и --restart-after-hours;
 #   * бот, проработав срок, дожидается, когда никто не ждёт ответа, и выходит с кодом 75 —
 #     сервер стирает логи (файл лога и его ротации) и запускает бота заново;
 #   * бот упал — перезапуск через 5 с, 10 с, 20 с… (до 5 мин; после 10 мин нормальной работы
 #     задержка снова 5 с); логи при этом не стираются — в них причина падения;
-#   * бот остановлен командой «Грань, стоп машина» (код 0) — сервер тоже завершается;
+#   * бот остановлен командой «Грань, стоп машина» (админ) или «0» + Enter в терминале
+#     (бот читает терминал сервера) — код 0, сервер тоже завершается;
 #   * бот завис и не вышел через час после срока перезапуска — процесс останавливается
 #     и запускается заново (логи сохраняются — в них видно, на чём он завис);
 #   * Ctrl+C / SIGTERM — сервер передаёт сигнал боту, ждёт его завершения и выходит.
@@ -24,8 +25,8 @@ import subprocess
 from datetime import datetime
 
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-BOT_SCRIPT = os.path.join(BOT_DIR, "bot6.py")
-RESTART_EXIT_CODE = 75             # как в bot6.py
+BOT_SCRIPT = os.path.join(BOT_DIR, "bot7.py")
+RESTART_EXIT_CODE = 75             # как в bot7.py
 BACKOFF_START_SEC = 5
 BACKOFF_MAX_SEC = 300
 BACKOFF_RESET_SEC = 600            # проработал столько — следующее падение снова с BACKOFF_START_SEC
@@ -49,7 +50,7 @@ def say(text, log_file=None):
 
 
 def clear_logs(log_file):
-    """Стирает лог и его ротации (bot6.log.1, …). Возвращает число освобождённых байт."""
+    """Стирает лог и его ротации (bot7.log.1, …). Возвращает число освобождённых байт."""
     freed = 0
     for path in [log_file] + glob.glob(glob.escape(log_file) + ".*"):
         try:
@@ -138,10 +139,10 @@ def run(args, popen=subprocess.Popen, sleep=time.sleep, clock=time.time):
 
 
 def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description="Серверный запуск bot6 с плановым перезапуском")
+    ap = argparse.ArgumentParser(description="Серверный запуск bot7 с плановым перезапуском")
     ap.add_argument("--restart-days", type=float, default=7,
                     help="перезапускать бота и стирать логи раз в столько суток (0 — не перезапускать)")
-    ap.add_argument("--log-file", default=os.path.join(BOT_DIR, "logs", "bot6.log"),
+    ap.add_argument("--log-file", default=os.path.join(BOT_DIR, "logs", "bot7.log"),
                     help="файл лога бота")
     ap.add_argument("--debug", action="store_true", help="бот с подробным логом")
     return ap.parse_args(argv)
