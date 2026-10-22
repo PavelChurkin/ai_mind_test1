@@ -9,7 +9,6 @@ import sys
 import shutil
 import signal
 import logging
-import tempfile
 import unittest
 import urllib.error
 from unittest import mock
