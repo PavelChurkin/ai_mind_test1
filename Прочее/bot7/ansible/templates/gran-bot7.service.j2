@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Бот «Грань» (bot7) для ВКонтакте
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User={{ bot7_user }}
+Group={{ bot7_user }}
+WorkingDirectory={{ bot7_dir }}
+Environment=PYTHONUNBUFFERED=1
+ExecStart={{ bot7_home }}/venv/bin/python {{ bot7_dir }}/bot7_server.py --restart-days {{ bot7_restart_days }}{{ ' --debug' if bot7_debug | bool else '' }}
+# «Грань, стоп машина» — бот и сервер выходят с кодом 0, systemd их не поднимает
+# (запустить снова: systemctl start {{ bot7_service }}); падение — перезапуск.
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
