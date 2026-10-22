@@ -1,6 +1,7 @@
 """
 Тесты для Прочее/bot6/rag.py (база знаний bot6, задача #15): чтение всех форматов, индекс,
 поиск по леммам, «ничего не нашлось», промпт и разбор ответа. Без сети и без LLM.
+Тот же набор для Прочее/bot7/rag.py (задача #17): RAG_BOT=bot7 или experiments/test_rag_bot7.py.
 
 Файлы doc/docx/pdf/epub — в experiments/rag_fixtures (сделаны LibreOffice из одного текста),
 txt/fb2/fb2.zip создаются в тесте.
@@ -18,7 +19,8 @@ import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(HERE, "rag_fixtures")
-spec = importlib.util.spec_from_file_location("rag", os.path.join(HERE, "..", "Прочее", "bot6", "rag.py"))
+RAG_BOT = os.environ.get("RAG_BOT", "bot6")
+spec = importlib.util.spec_from_file_location("rag", os.path.join(HERE, "..", "Прочее", RAG_BOT, "rag.py"))
 rag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rag)
 

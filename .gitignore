@@ -24,10 +24,15 @@ build/
 # Memory files
 analyze.txt
 
-# bot5/bot6: базы, индекс базы знаний, логи
+# bot5/bot6/bot7: базы, индекс базы знаний, логи
 *.db
 *.db-wal
 *.db-shm
 *.db-journal
 Прочее/bot6/logs/
 Прочее/bot6/RAG/
+Прочее/bot7/logs/
+Прочее/bot7/RAG/
+# bot7/ansible: адрес сервера и токены
+Прочее/bot7/ansible/inventory.ini
+Прочее/bot7/ansible/secrets.yml

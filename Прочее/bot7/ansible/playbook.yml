@@ -1,0 +1,200 @@
+---
+# Установка бота «Грань» (bot7) на чистый сервер с Linux (Debian/Ubuntu, а также RHEL/Rocky/Alma/Fedora).
+#
+#   ansible-playbook -i inventory.ini playbook.yml -e @secrets.yml --ask-vault-pass
+#
+# Что делает:
+#   * ставит python3 (даже если на сервере его нет — через raw), venv, git;
+#   * создаёт системного пользователя bot7_user и папку bot7_home;
+#   * кладёт код бота: из этой папки (bot7_source: local) или клоном репозитория (bot7_source: git);
+#   * создаёт виртуальное окружение и ставит requirements.txt;
+#   * пишет .env с токенами (права 600) и, если указано, копирует книги в RAG;
+#   * ставит службу systemd (bot7_server.py: перезапуск раз в bot7_restart_days суток с очисткой логов,
+#     после падения — systemd перезапускает) и запускает её.
+# Повторный запуск обновляет код и зависимости и перезапускает бота; база gran7.db, индекс
+# базы знаний и логи сохраняются.
+- name: Бот «Грань» (bot7)
+  hosts: bot7
+  become: true
+  gather_facts: false
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    bot7_user: gran
+    bot7_home: /opt/gran
+    bot7_source: local            # local — файлы из этой папки; git — клон bot7_git_repo
+    bot7_git_repo: https://github.com/PavelChurkin/ai_mind_test1.git
+    bot7_git_version: main
+    bot7_local_dir: "{{ playbook_dir }}/.."
+    bot7_files:                   # что копируется при bot7_source: local
+      - bot7.py
+      - bot7_server.py
+      - filosof.py
+      - rag.py
+      - requirements.txt
+      - nouns.json
+      - verbs.json
+      - adject.json
+      - Роль.txt
+    bot7_rag_src: ""              # папка с книгами на машине, откуда запускается Ansible ("" — не копировать)
+    bot7_restart_days: 7
+    bot7_debug: false
+    bot7_timezone: ""             # например Europe/Moscow ("" — не менять)
+    bot7_service: gran-bot7
+    bot7_manage_service: true     # false — только файлы (например, в контейнере без systemd)
+    # Секреты — в secrets.yml (см. secrets.example.yml), лучше зашифровать: ansible-vault encrypt secrets.yml
+    vk_group_id: ""
+    vk_token: ""
+    proxyapi_key: ""
+    admin_ids: ""
+    vk_user_token: ""
+
+  tasks:
+    # Ansible нужен python3 на сервере, become — sudo, а become_user (непривилегированный
+    # пользователь) — acl; на чистом сервере их может не быть. raw работает без них.
+    - name: Python 3, sudo и acl для Ansible
+      ansible.builtin.raw: >-
+        S=""; [ "$(id -u)" = 0 ] || S=sudo;
+        if test -x /usr/bin/python3 && command -v sudo >/dev/null && command -v setfacl >/dev/null; then exit 0; fi;
+        echo installing;
+        if command -v apt-get >/dev/null; then
+        $S apt-get update -q && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3 sudo acl;
+        elif command -v dnf >/dev/null; then $S dnf install -y -q python3 sudo acl;
+        else $S yum install -y -q python3 sudo acl; fi
+      become: false
+      register: bot7_bootstrap
+      changed_when: "'installing' in bot7_bootstrap.stdout"
+
+    - name: Сведения о сервере
+      ansible.builtin.setup:
+
+    - name: Заданы токены и ID сообщества
+      ansible.builtin.assert:
+        that:
+          - vk_group_id | string | length > 0
+          - vk_token | length > 0
+          - proxyapi_key | length > 0
+          - bot7_source in ['local', 'git']
+        fail_msg: "Нужны vk_group_id, vk_token, proxyapi_key (см. secrets.example.yml); bot7_source — local или git."
+        quiet: true
+
+    - name: Пакеты (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name: [python3, python3-venv, python3-pip, git, ca-certificates, tzdata]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_facts.os_family == 'Debian'
+
+    - name: Пакеты (RHEL/Fedora)
+      ansible.builtin.dnf:
+        name: [python3, python3-pip, git, ca-certificates, tzdata]
+        state: present
+      when: ansible_facts.os_family == 'RedHat'
+
+    - name: Часовой пояс
+      ansible.builtin.command: timedatectl set-timezone {{ bot7_timezone }}
+      when: bot7_timezone | length > 0 and ansible_facts.date_time.tz != bot7_timezone
+      changed_when: true
+
+    - name: Пользователь {{ bot7_user }}
+      ansible.builtin.user:
+        name: "{{ bot7_user }}"
+        system: true
+        home: "{{ bot7_home }}"
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Папка {{ bot7_home }}
+      ansible.builtin.file:
+        path: "{{ bot7_home }}"
+        state: directory
+        owner: "{{ bot7_user }}"
+        group: "{{ bot7_user }}"
+        mode: "0750"
+
+    - name: Папка бота
+      ansible.builtin.set_fact:
+        bot7_dir: "{{ bot7_home ~ '/repo/Прочее/bot7' if bot7_source == 'git' else bot7_home ~ '/bot7' }}"
+
+    - name: Код бота — клон репозитория
+      ansible.builtin.git:
+        repo: "{{ bot7_git_repo }}"
+        version: "{{ bot7_git_version }}"
+        dest: "{{ bot7_home }}/repo"
+        force: false              # база, индекс, логи и .env не в git — не трогаются
+      become_user: "{{ bot7_user }}"
+      when: bot7_source == 'git'
+      notify: Перезапустить бота
+
+    - name: Папка с кодом бота
+      ansible.builtin.file:
+        path: "{{ bot7_dir }}"
+        state: directory
+        owner: "{{ bot7_user }}"
+        group: "{{ bot7_user }}"
+        mode: "0750"
+      when: bot7_source == 'local'
+
+    - name: Код бота — файлы из этой папки
+      ansible.builtin.copy:
+        src: "{{ bot7_local_dir }}/{{ item }}"
+        dest: "{{ bot7_dir }}/{{ item }}"
+        owner: "{{ bot7_user }}"
+        group: "{{ bot7_user }}"
+        mode: "0640"
+      loop: "{{ bot7_files }}"
+      when: bot7_source == 'local'
+      notify: Перезапустить бота
+
+    - name: Виртуальное окружение и зависимости
+      ansible.builtin.pip:
+        requirements: "{{ bot7_dir }}/requirements.txt"
+        virtualenv: "{{ bot7_home }}/venv"
+        virtualenv_command: python3 -m venv
+      become_user: "{{ bot7_user }}"
+      notify: Перезапустить бота
+
+    - name: Токены (.env)
+      ansible.builtin.template:
+        src: env.j2
+        dest: "{{ bot7_dir }}/.env"
+        owner: "{{ bot7_user }}"
+        group: "{{ bot7_user }}"
+        mode: "0600"
+      no_log: true
+      notify: Перезапустить бота
+
+    - name: Книги базы знаний (RAG)
+      ansible.builtin.copy:
+        src: "{{ bot7_rag_src }}/"
+        dest: "{{ bot7_dir }}/RAG/"
+        owner: "{{ bot7_user }}"
+        group: "{{ bot7_user }}"
+        mode: "0640"
+        directory_mode: "0750"
+      when: bot7_rag_src | length > 0
+      notify: Перезапустить бота
+
+    - name: Служба systemd
+      ansible.builtin.template:
+        src: gran-bot7.service.j2
+        dest: /etc/systemd/system/{{ bot7_service }}.service
+        mode: "0644"
+      notify: Перезапустить бота
+
+    - name: Служба включена и запущена
+      ansible.builtin.systemd_service:
+        name: "{{ bot7_service }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: bot7_manage_service | bool
+
+  handlers:
+    - name: Перезапустить бота
+      ansible.builtin.systemd_service:
+        name: "{{ bot7_service }}"
+        state: restarted
+        daemon_reload: true
+      when: bot7_manage_service | bool
