@@ -1,0 +1,200 @@
+---
+# Установка бота «Грань» (bot8) на чистый сервер с Linux (Debian/Ubuntu, а также RHEL/Rocky/Alma/Fedora).
+#
+#   ansible-playbook -i inventory.ini playbook.yml -e @secrets.yml --ask-vault-pass
+#
+# Что делает:
+#   * ставит python3 (даже если на сервере его нет — через raw), venv, git;
+#   * создаёт системного пользователя bot8_user и папку bot8_home;
+#   * кладёт код бота: из этой папки (bot8_source: local) или клоном репозитория (bot8_source: git);
+#   * создаёт виртуальное окружение и ставит requirements.txt;
+#   * пишет .env с токенами (права 600) и, если указано, копирует книги в RAG;
+#   * ставит службу systemd (bot8_server.py: перезапуск раз в bot8_restart_days суток с очисткой логов,
+#     после падения — systemd перезапускает) и запускает её.
+# Повторный запуск обновляет код и зависимости и перезапускает бота; база gran7.db, индекс
+# базы знаний и логи сохраняются.
+- name: Бот «Грань» (bot8)
+  hosts: bot8
+  become: true
+  gather_facts: false
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    bot8_user: gran
+    bot8_home: /opt/gran
+    bot8_source: local            # local — файлы из этой папки; git — клон bot8_git_repo
+    bot8_git_repo: https://github.com/PavelChurkin/ai_mind_test1.git
+    bot8_git_version: main
+    bot8_local_dir: "{{ playbook_dir }}/.."
+    bot8_files:                   # что копируется при bot8_source: local
+      - bot8.py
+      - bot8_server.py
+      - filosof.py
+      - rag.py
+      - requirements.txt
+      - nouns.json
+      - verbs.json
+      - adject.json
+      - Роль.txt
+    bot8_rag_src: ""              # папка с книгами на машине, откуда запускается Ansible ("" — не копировать)
+    bot8_restart_days: 7
+    bot8_debug: false
+    bot8_timezone: ""             # например Europe/Moscow ("" — не менять)
+    bot8_service: gran-bot8
+    bot8_manage_service: true     # false — только файлы (например, в контейнере без systemd)
+    # Секреты — в secrets.yml (см. secrets.example.yml), лучше зашифровать: ansible-vault encrypt secrets.yml
+    vk_group_id: ""
+    vk_token: ""
+    proxyapi_key: ""
+    admin_ids: ""
+    vk_user_token: ""
+
+  tasks:
+    # Ansible нужен python3 на сервере, become — sudo, а become_user (непривилегированный
+    # пользователь) — acl; на чистом сервере их может не быть. raw работает без них.
+    - name: Python 3, sudo и acl для Ansible
+      ansible.builtin.raw: >-
+        S=""; [ "$(id -u)" = 0 ] || S=sudo;
+        if test -x /usr/bin/python3 && command -v sudo >/dev/null && command -v setfacl >/dev/null; then exit 0; fi;
+        echo installing;
+        if command -v apt-get >/dev/null; then
+        $S apt-get update -q && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3 sudo acl;
+        elif command -v dnf >/dev/null; then $S dnf install -y -q python3 sudo acl;
+        else $S yum install -y -q python3 sudo acl; fi
+      become: false
+      register: bot8_bootstrap
+      changed_when: "'installing' in bot8_bootstrap.stdout"
+
+    - name: Сведения о сервере
+      ansible.builtin.setup:
+
+    - name: Заданы токены и ID сообщества
+      ansible.builtin.assert:
+        that:
+          - vk_group_id | string | length > 0
+          - vk_token | length > 0
+          - proxyapi_key | length > 0
+          - bot8_source in ['local', 'git']
+        fail_msg: "Нужны vk_group_id, vk_token, proxyapi_key (см. secrets.example.yml); bot8_source — local или git."
+        quiet: true
+
+    - name: Пакеты (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name: [python3, python3-venv, python3-pip, git, ca-certificates, tzdata]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_facts.os_family == 'Debian'
+
+    - name: Пакеты (RHEL/Fedora)
+      ansible.builtin.dnf:
+        name: [python3, python3-pip, git, ca-certificates, tzdata]
+        state: present
+      when: ansible_facts.os_family == 'RedHat'
+
+    - name: Часовой пояс
+      ansible.builtin.command: timedatectl set-timezone {{ bot8_timezone }}
+      when: bot8_timezone | length > 0 and ansible_facts.date_time.tz != bot8_timezone
+      changed_when: true
+
+    - name: Пользователь {{ bot8_user }}
+      ansible.builtin.user:
+        name: "{{ bot8_user }}"
+        system: true
+        home: "{{ bot8_home }}"
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Папка {{ bot8_home }}
+      ansible.builtin.file:
+        path: "{{ bot8_home }}"
+        state: directory
+        owner: "{{ bot8_user }}"
+        group: "{{ bot8_user }}"
+        mode: "0750"
+
+    - name: Папка бота
+      ansible.builtin.set_fact:
+        bot8_dir: "{{ bot8_home ~ '/repo/Прочее/bot8' if bot8_source == 'git' else bot8_home ~ '/bot8' }}"
+
+    - name: Код бота — клон репозитория
+      ansible.builtin.git:
+        repo: "{{ bot8_git_repo }}"
+        version: "{{ bot8_git_version }}"
+        dest: "{{ bot8_home }}/repo"
+        force: false              # база, индекс, логи и .env не в git — не трогаются
+      become_user: "{{ bot8_user }}"
+      when: bot8_source == 'git'
+      notify: Перезапустить бота
+
+    - name: Папка с кодом бота
+      ansible.builtin.file:
+        path: "{{ bot8_dir }}"
+        state: directory
+        owner: "{{ bot8_user }}"
+        group: "{{ bot8_user }}"
+        mode: "0750"
+      when: bot8_source == 'local'
+
+    - name: Код бота — файлы из этой папки
+      ansible.builtin.copy:
+        src: "{{ bot8_local_dir }}/{{ item }}"
+        dest: "{{ bot8_dir }}/{{ item }}"
+        owner: "{{ bot8_user }}"
+        group: "{{ bot8_user }}"
+        mode: "0640"
+      loop: "{{ bot8_files }}"
+      when: bot8_source == 'local'
+      notify: Перезапустить бота
+
+    - name: Виртуальное окружение и зависимости
+      ansible.builtin.pip:
+        requirements: "{{ bot8_dir }}/requirements.txt"
+        virtualenv: "{{ bot8_home }}/venv"
+        virtualenv_command: python3 -m venv
+      become_user: "{{ bot8_user }}"
+      notify: Перезапустить бота
+
+    - name: Токены (.env)
+      ansible.builtin.template:
+        src: env.j2
+        dest: "{{ bot8_dir }}/.env"
+        owner: "{{ bot8_user }}"
+        group: "{{ bot8_user }}"
+        mode: "0600"
+      no_log: true
+      notify: Перезапустить бота
+
+    - name: Книги базы знаний (RAG)
+      ansible.builtin.copy:
+        src: "{{ bot8_rag_src }}/"
+        dest: "{{ bot8_dir }}/RAG/"
+        owner: "{{ bot8_user }}"
+        group: "{{ bot8_user }}"
+        mode: "0640"
+        directory_mode: "0750"
+      when: bot8_rag_src | length > 0
+      notify: Перезапустить бота
+
+    - name: Служба systemd
+      ansible.builtin.template:
+        src: gran-bot8.service.j2
+        dest: /etc/systemd/system/{{ bot8_service }}.service
+        mode: "0644"
+      notify: Перезапустить бота
+
+    - name: Служба включена и запущена
+      ansible.builtin.systemd_service:
+        name: "{{ bot8_service }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: bot8_manage_service | bool
+
+  handlers:
+    - name: Перезапустить бота
+      ansible.builtin.systemd_service:
+        name: "{{ bot8_service }}"
+        state: restarted
+        daemon_reload: true
+      when: bot8_manage_service | bool

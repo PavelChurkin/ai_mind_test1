@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Бот «Грань» (bot8) для ВКонтакте
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User={{ bot8_user }}
+Group={{ bot8_user }}
+WorkingDirectory={{ bot8_dir }}
+Environment=PYTHONUNBUFFERED=1
+ExecStart={{ bot8_home }}/venv/bin/python {{ bot8_dir }}/bot8_server.py --restart-days {{ bot8_restart_days }}{{ ' --debug' if bot8_debug | bool else '' }}
+# «Грань, стоп машина» — бот и сервер выходят с кодом 0, systemd их не поднимает
+# (запустить снова: systemctl start {{ bot8_service }}); падение — перезапуск.
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
