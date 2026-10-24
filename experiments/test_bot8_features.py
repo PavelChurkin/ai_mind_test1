@@ -1,5 +1,5 @@
 """
-Тесты новых возможностей bot8 (задача #17). Окружение (подменные ВК, LLM, часы) — из test_bot8.py.
+Тесты новых возможностей bot8 (задача #19, регрессии bot7). Окружение (подменные ВК, LLM, часы) — из test_bot8.py.
 
 Запуск: python3 -m unittest experiments/test_bot8_features.py -v
 """
@@ -364,7 +364,7 @@ class TestSplitMessages(Bot8Case):
         self.t += 1
         self.say("/помощь")
         self.assertEqual(bot8.db_get_role(CHAT), "р" * self.LONG)
-        self.assertIn("Команды бота", self.sent()[-1])
+        self.assertIn("Команды бота", "\n".join(self.sent()))
 
     def test_remember_text_joined(self):
         self.say("Грань, запомни " + "з" * self.LONG, from_id=ADMIN)
@@ -486,12 +486,12 @@ class TestRemember(Bot8Case):
     def path(self):
         return os.path.join(bot8.RAG_DIR, bot8.REMEMBER_FILE)
 
-    def test_forwarded_messages_overwrite_file_and_reindex(self):
+    def test_forwarded_messages_reset_file_and_reindex(self):
         self.say("Грань, запомни", from_id=ADMIN, fwd_messages=[self.fwd("Истина рождается в споре.")])
         with open(self.path(), encoding="utf-8") as f:
             self.assertEqual(f.read(), "Истина рождается в споре.\n")
         self.assertIn("Запомнила", self.sent()[-1])
-        self.say("Грань, запомни", from_id=ADMIN,
+        self.say("Грань, запомни с нуля", from_id=ADMIN,
                  fwd_messages=[self.fwd("Сомнение — начало мудрости."), self.fwd("Согласен.", from_id=ADMIN)])
         with open(self.path(), encoding="utf-8") as f:
             text = f.read()
@@ -511,7 +511,7 @@ class TestRemember(Bot8Case):
             self.assertEqual(f.read(), "Из ответа.\n")
         self.say("/запомни Текст прямо в команде", from_id=ADMIN)
         with open(self.path(), encoding="utf-8") as f:
-            self.assertEqual(f.read(), "Текст прямо в команде\n")
+            self.assertEqual(f.read(), "Из ответа.\nТекст прямо в команде\n")
 
     def test_admin_only_and_empty(self):
         self.say("Грань, запомни", fwd_messages=[self.fwd("не админ")])
@@ -615,7 +615,7 @@ class TestTokenLimit(Bot8Case):
     def test_help_and_show_reset_time(self):
         self.say("/лимит токенов 3000", from_id=ADMIN)
         self.say("/помощь")
-        self.assertIn("лимит токенов ответа: 3000 (до 16:00, потом 800)", self.sent()[-1])
+        self.assertIn("лимит токенов ответа: 3000 (до 16:00, потом 800)", "\n".join(self.sent()))
         self.say("/лимит токенов", from_id=ADMIN)
         self.assertIn("Лимит выходных токенов: 3000 (стандарт 800). До 16:00", self.sent()[-1])
 

@@ -14,12 +14,14 @@
 Запуск (нужны vk_api, openai, python-dotenv, для РАГ — pymorphy3):
     python3 experiments/smoke_bot8_main.py
 """
+import io
 import os
 import time
 import sqlite3
 import tempfile
 import importlib.util
 from types import SimpleNamespace
+from unittest import mock
 
 import vk_api
 import vk_api.bot_longpoll as bl
@@ -143,8 +145,8 @@ os.environ.pop("BOT_DEBUG", None)
 def configure(bot8, d):
     bot8.BATCH_WAIT_SEC = 0.3
     bot8.LLM_MIN_INTERVAL_SEC = 0
-    bot8.DB_PATH = os.path.join(d, "gran7.db")
-    bot8.OLD_DB_PATH = os.path.join(d, "нет_gran5.db")
+    bot8.DB_PATH = os.path.join(d, "gran8.db")
+    bot8.OLD_DB_PATH = os.path.join(d, "нет_gran7.db")
     bot8.RAG_DIR = os.path.join(d, "RAG")
     bot8.RAG_INDEX_PATH = os.path.join(d, "rag_index.db")
     bot8.ROLE_FILE = os.path.join(d, "Роль.txt")
@@ -180,7 +182,7 @@ with tempfile.TemporaryDirectory() as d:
         (lambda: len(SENT) >= 2, lambda: [new(4, "Грань, РАГ квантовая хромодинамика")]),
         (lambda: len(SENT) >= 3, lambda: [new(5, "Грань, стоп машина")]),
     ]
-    code = run_main(bot8, ["--log-file", log_file])
+    code = run_main(bot8, ["--log-file", log_file, "--no-terminal"])
     rows = sqlite3.connect(bot8.DB_PATH).execute(
         "SELECT cmid, from_id, text FROM messages WHERE peer_id=? ORDER BY id", (PEER,)).fetchall()
 
@@ -213,10 +215,30 @@ with tempfile.TemporaryDirectory() as d:
     LLM_CALLS.clear()
     SCRIPT[:] = [(lambda: True, lambda: [new(6, "Грань, ты тут?")])]
     started = time.time()
-    code = run_main(bot8, ["--log-file", log_file, "--restart-after-hours", str(1 / 3600)])
+    code = run_main(bot8, ["--log-file", log_file, "--no-terminal", "--restart-after-hours", str(1 / 3600)])
     print("Запуск 2: код", code, "отправлено", texts(), f"за {time.time() - started:.1f} с")
     assert code == bot8.RESTART_EXIT_CODE == 75, code
     assert texts() == ["Привет, Пётр! Дела хорошо."], "перед перезапуском бот дождался ответа"
     assert time.time() - started >= 1
+
+    # ---------- запуск 3: команды stdin исполняются главным потоком, только в терминал ----------
+    bot8 = load_bot8()
+    configure(bot8, d)
+    SENT.clear()
+    LLM_CALLS.clear()
+    SCRIPT.clear()
+    terminal = io.StringIO(f"/чат {PEER}\n/роль терминальный философ\n/контекст 7\n/помощь\n0\n")
+    output = io.StringIO()
+    with mock.patch('sys.stdin', terminal), mock.patch('sys.stdout', output):
+        code = run_main(bot8, ["--log-file", log_file])
+    assert code == 0, code
+    assert not SENT and not LLM_CALLS, (SENT, LLM_CALLS)
+    assert 'Команды бота' in output.getvalue(), output.getvalue()
+    assert 'Роль обновлена' in output.getvalue(), output.getvalue()
+    with sqlite3.connect(bot8.DB_PATH) as db:
+        assert db.execute('SELECT role FROM roles WHERE peer_id=?', (PEER,)).fetchone()[0] == 'терминальный философ'
+        setting = db.execute('SELECT value FROM state WHERE key=?', (f'ctx_{PEER}',)).fetchone()[0]
+        assert setting.split('|')[0] == '7', setting
+    print('Запуск 3: команды stdin и остановка, ни одного сообщения в ВК — OK')
 
 print("OK")

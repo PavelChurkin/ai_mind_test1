@@ -1,7 +1,7 @@
 """
-Тесты для Прочее/bot8/bot8.py (задача #17). Без токенов и сети: ВК и LLM подменены,
-время — управляемые часы (bot8.now). Первая часть — тесты bot6, перенесённые без изменения
-смысла; новые возможности bot8 — в test_bot8_features.py.
+Тесты для Прочее/bot8/bot8.py (задача #19, регрессии bot7). Без токенов и сети: ВК и LLM подменены,
+время — управляемые часы (bot8.now). Первая часть — тесты bot7, перенесённые без изменения
+смысла; новые возможности bot8 — в test_bot8_new.py.
 
 Запуск: python3 -m unittest experiments/test_bot8.py -v
 """
@@ -122,6 +122,9 @@ class Bot8Case(unittest.TestCase):
         bot8.IMAGE_MODE = "url"
         bot8.STOP_REQUESTED = False
         bot8.PEERS.clear()
+        bot8.TERMINAL_PEER = None
+        bot8.TERMINAL_LINES = bot8.queue.Queue()
+        bot8._terminal_output = None
         bot8._admin_cache.clear()
         bot8._image_cache.clear()
         bot8._ssl_contexts = None
@@ -658,11 +661,11 @@ class TestContextCompression(Bot8Case):
         self.assertFalse(hasattr(bot8, "POST_MAX_CHARS"))
 
 
-# ---------- переход с bot6 ----------
+# ---------- переход с bot7 ----------
 class TestMigration(Bot8Case):
-    def test_migrate_from_bot6(self):
+    def test_migrate_from_bot7(self):
         with tempfile.TemporaryDirectory() as d:
-            old_path = os.path.join(d, "gran6.db")
+            old_path = os.path.join(d, "gran7.db")
             old = sqlite3.connect(old_path)
             old.executescript("""
                 CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_id INTEGER NOT NULL,
@@ -680,26 +683,32 @@ class TestMigration(Bot8Case):
             old.execute("INSERT INTO state VALUES(?,?)", (f"forget_{CHAT}", "5"))
             old.execute("INSERT INTO state VALUES(?,?)", (f"chars_{CHAT}", f"50000|{START}"))
             old.execute("INSERT INTO state VALUES(?,?)", (f"history_complete_{CHAT}", "1"))
-            old.execute("INSERT INTO state VALUES(?,?)", (f"daily_{CHAT}", "{}"))   # не переносится
+            old.execute("INSERT INTO state VALUES(?,?)", (f"daily_{CHAT}", "{}"))   # сохраняется при переходе на bot8
+            old.execute("INSERT INTO state VALUES(?,?)", (f"ctx_{CHAT}", f"50|{START}"))
+            old.execute("INSERT INTO state VALUES(?,?)", (f"rag_{CHAT}", "1"))
+            old.execute("INSERT INTO state VALUES(?,?)", (f"reasoning_{CHAT}", "1"))
             old.commit()
             old.close()
-            bot8.migrate_from_bot6(old_path)
-            bot8.migrate_from_bot6(old_path)            # повторно — без дублей
-            bot8.db_state_del("migrated_bot6")
-            bot8.migrate_from_bot6(old_path)            # и даже если флаг потерян
+            bot8.migrate_from_bot7(old_path)
+            bot8.migrate_from_bot7(old_path)            # повторно — без дублей
+            bot8.db_state_del("migrated_bot7")
+            bot8.migrate_from_bot7(old_path)            # и даже если флаг потерян
         self.assertEqual(bot8.DB.execute("SELECT text FROM messages").fetchall(), [("старое",)])
         self.assertEqual(bot8.db_get_role(CHAT), "поэт")
         self.assertEqual(bot8.display_name(USER), "Пётр")
         self.assertEqual(bot8.db_state_get(f"forget_{CHAT}"), "5")
         self.assertEqual(bot8.chars_limit(CHAT), 50000)
         self.assertEqual(bot8.db_state_get(f"history_complete_{CHAT}"), "1")
-        self.assertIsNone(bot8.db_state_get(f"daily_{CHAT}"))
+        self.assertEqual(bot8.db_state_get(f"daily_{CHAT}"), "{}")
+        self.assertEqual(bot8.context_size(CHAT), 50)
+        self.assertTrue(bot8.rag_mode(CHAT))
+        self.assertTrue(bot8.reasoning_enabled(CHAT))
         self.assertEqual(bot8.db_state_get("initial_load_done"), "1")
-        self.assertEqual(bot8.db_state_get("migrated_bot6"), "1")
+        self.assertEqual(bot8.db_state_get("migrated_bot7"), "1")
 
     def test_find_old_db(self):
         with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "gran6.db")
+            path = os.path.join(d, "gran7.db")
             bot8.OLD_DB_PATH = path
             try:
                 self.assertIsNone(bot8.find_old_db())

@@ -1,18 +1,4 @@
-# bot8.py — бот «Грань» для чата сообщества ВКонтакте (следующая версия bot6, задача #17)
-#
-# Что изменилось по сравнению с bot6 (подробно — в README.md этой папки):
-#   * база знаний — режим беседы «/раг вкл» / «/раг выкл»: во включённом режиме перед каждым
-#     ответом — поиск по базе знаний, ответ строго по найденным фрагментам; не нашлось —
-#     ответ начинается с «Поиск по базе знаний не дал результата.»; «РАГ+» убран;
-#     «/лимит чанков N» — сколько фрагментов передавать модели;
-#   * «/рассуждения вкл» / «/рассуждения выкл»: рассуждение модели включено и показывается
-#     в начале ответа между маркерами #рассуждения# (по умолчанию выключено);
-#   * /мысль — без повтора и без увеличения лимита токенов; в промптах философа вместо
-#     «не больше 100 слов» — «пиши кратко»;
-#   * размер контекста: «/контекст N», «/автоконтекст» (по пересланному сообщению или
-#     reply), «/автоконтекст 2 ч», «/сброс контекста [N]»; рост контекста в споре убран;
-#   * остановка: «0» + Enter в терминале; «Грань, стоп машина» — только админ;
-#   * ansible/ — установка бота на чистый Linux-сервер.
+# bot8.py — «Грань», следующая версия bot7 (задача #19); команды — README.md
 import os
 import re
 import ssl
@@ -23,6 +9,8 @@ import time
 import base64
 import signal
 import threading
+import queue
+from contextlib import contextmanager
 import sqlite3
 import argparse
 import functools
@@ -43,7 +31,7 @@ import rag      # noqa: E402
 BOT_NAME = "Грань разумного"
 TRIGGER_RE = re.compile(r"\bгрань\b", re.IGNORECASE)
 STOP_PHRASE = "грань, стоп машина"   # остановка из чата — только админ (ADMIN_IDS или админ беседы)
-TERMINAL_STOP = True               # «0» + Enter в терминале, где запущен бот, — остановить бота
+TERMINAL_STOP = True               # читать команды терминала, в том числе «0» для остановки
 
 # --- личные сообщения и права ---
 ALLOW_PRIVATE_MESSAGES = False     # можно ли боту отвечать в личных сообщениях (по умолчанию — нет)
@@ -57,6 +45,7 @@ CONTEXT_MIN_MESSAGES = 10          # столько последних сооб�
 CONTEXT_MEMORY_HOURS = 12          # более старые сообщения — только в пределах CONTEXT_MIN_MESSAGES (0 — без ограничения);
                                    # при размере, заданном /контекст или /автоконтекст, не действует
 MAX_CONTEXT_CHARS = 12000          # стандартный лимит символов истории в запросе (меняется /лимит символов)
+AUTO_CHARS_SECONDS = 60            # временный рост после команд контекста/внимания
 MAX_CONTEXT_CHARS_CAP = 300000     # больше этого /лимит символов не поставит
 CONTEXT_SUMMARY_CHARS = 2000       # размер сжатого пересказа старой части истории
 CONTEXT_KEEP_SHARE = 0.6           # после сжатия свежая часть занимает не больше этой доли остатка
@@ -103,7 +92,7 @@ RAG_EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
 RAG_NOTHING_FOUND = "В базе знаний ничего не нашлось."                 # «/раг вопрос» без находок
 RAG_MODE_DEFAULT = False           # режим «/раг вкл» в новой беседе
 RAG_NO_RESULT_PREFIX = "Поиск по базе знаний не дал результата."     # режим «/раг вкл»: начало ответа без находок
-REMEMBER_FILE = "Рефлексия.txt"    # «Грань, запомни» перезаписывает этот файл в RAG_DIR
+REMEMBER_FILE = "Рефлексия.txt"    # «запомни» дописывает; «запомни с нуля» заменяет
 REMEMBER_ADMIN_ONLY = True         # «Грань, запомни» — только админ беседы (False — все)
 
 # --- дневной лимит ---
@@ -139,9 +128,9 @@ LLM_MIN_INTERVAL_SEC = 3           # не чаще одного запроса �
 VK_MESSAGE_LIMIT = 4000            # ВК режет сообщения длиннее 4096 символов
 LONGPOLL_WAIT_SEC = 1              # Long Poll возвращается не реже — чтобы вовремя отвечать пакетам
 
-DB_PATH = os.path.join(BOT_DIR, "gran7.db")
-OLD_DB_NAME = "gran6.db"           # БД bot6: ищется рядом с ботом, в текущей папке и в ../bot6
-OLD_DB_PATH = None                 # явный путь к БД bot6 (если задан — ищется только он)
+DB_PATH = os.path.join(BOT_DIR, "gran8.db")
+OLD_DB_NAME = "gran7.db"           # БД bot7: ищется рядом с ботом, в текущей папке и в ../bot7
+OLD_DB_PATH = None                 # явный путь к БД bot7 (если задан — ищется только он)
 
 # --- лог и перезапуск ---
 LOG_MAX_MB = 50                    # файл лога (--log-file) больше этого — ротация
@@ -185,6 +174,10 @@ PEERS = {}                         # peer_id -> PeerState: очередь обр
 FILOSOF = filosof.ThoughtGenerator()
 KB = None                          # база знаний rag.KnowledgeBase (get_kb)
 _image_cache = OrderedDict()       # url -> часть запроса с картинкой
+TERMINAL_LINES = queue.Queue()     # stdin-поток только кладёт строки; БД — в главном потоке
+TERMINAL_PEER = None
+_terminal_output = None
+
 _ssl_contexts = None
 _role_file_cache = (None, None)    # (mtime, текст) файла роли
 
@@ -280,6 +273,7 @@ def db_init(path=DB_PATH):
             ON messages(peer_id, cmid) WHERE cmid > 0;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_peer_msg
             ON messages(peer_id, vk_msg_id) WHERE vk_msg_id > 0;
+        CREATE TABLE IF NOT EXISTS context_controls (message_id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS roles (peer_id INTEGER PRIMARY KEY, role TEXT);
         CREATE TABLE IF NOT EXISTS users (
@@ -333,7 +327,8 @@ def _rows(rows):
     return [(r[0], r[1], r[2], r[3], r[4], json.loads(r[5]) if r[5] else []) for r in rows]
 
 
-NOT_SYSTEM_SQL = "NOT (is_bot=1 AND COALESCE(text,'') LIKE ?)"   # параметр: SYSTEM_MARK + "%"
+NOT_SYSTEM_SQL = ("NOT (is_bot=1 AND COALESCE(text,'') LIKE ?) "
+                  "AND id NOT IN (SELECT message_id FROM context_controls)")   # параметр: SYSTEM_MARK + "%"
 
 
 def db_get_context(peer_id, limit, since_ts=None, min_rows=0, exclude_ids=(), after_ts=None):
@@ -466,20 +461,20 @@ def db_upsert_user(user_id, first_name, last_name=""):
 
 
 def find_old_db():
-    """БД bot6: OLD_DB_PATH, иначе gran6.db рядом с ботом, в текущей папке или в ../bot6."""
+    """БД bot7: OLD_DB_PATH, иначе gran7.db рядом с ботом, в текущей папке или в ../bot7."""
     if OLD_DB_PATH:
         return OLD_DB_PATH if os.path.exists(OLD_DB_PATH) else None
-    for folder in (BOT_DIR, os.getcwd(), os.path.join(BOT_DIR, "..", "bot6")):
+    for folder in (BOT_DIR, os.getcwd(), os.path.join(BOT_DIR, "..", "bot7")):
         path = os.path.join(folder, OLD_DB_NAME)
         if os.path.exists(path):
             return path
     return None
 
 
-def migrate_from_bot6(old_path=None):
-    """Переносит из БД bot6 сообщения, роли, имена и настройки бесед (/забудь, /лимит символов,
+def migrate_from_bot7(old_path=None):
+    """Переносит из БД bot7 сообщения, роли, имена и настройки бесед (/забудь, /лимит символов,
     начало истории чата): схема та же, загружать историю из ВК заново не нужно."""
-    if db_state_get("migrated_bot6") == "1":
+    if db_state_get("migrated_bot7") == "1":
         return
     old_path = old_path or find_old_db()
     if not old_path:
@@ -497,17 +492,18 @@ def migrate_from_bot6(old_path=None):
         for row in old.execute("SELECT user_id, first_name, last_name, updated_at FROM users"):
             DB.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)", row)
         for key, value in old.execute(
-                "SELECT key, value FROM state WHERE key LIKE 'forget_%' OR key LIKE 'chars_%' "
-                "OR key LIKE 'history_complete_%'"):
+                "SELECT key, value FROM state"):
+            if key.startswith(("migrated_", "stopped_")):
+                continue
             DB.execute("INSERT OR IGNORE INTO state(key, value) VALUES(?,?)", (key, value))
         old.close()
         DB.commit()
         if n:
             db_state_set("initial_load_done", "1")
-        db_state_set("migrated_bot6", "1")
+        db_state_set("migrated_bot7", "1")
         log.info("Из %s перенесено %d сообщений, роли, имена и настройки бесед", old_path, n)
     except Exception as e:
-        log.warning("migrate_from_bot6 (%s): %s", old_path, e)
+        log.warning("migrate_from_bot7 (%s): %s", old_path, e)
 
 
 # ============ Имена ============
@@ -738,6 +734,11 @@ def store_vk_message(peer_id, msg):
         msg.get("date") or int(now()),
         cmid=msg.get("conversation_message_id"), vk_msg_id=msg.get("id"), images=images,
     )
+    command = parse_command(msg.get("text"), addressed=False)
+    if rowid and command and (command[0] == "внимание" or
+                              (command[0] == "контекст" and msg.get("fwd_messages"))):
+        DB.execute("INSERT OR IGNORE INTO context_controls VALUES(?)", (rowid,))
+        DB.commit()
     return rowid, text, images
 
 
@@ -764,7 +765,16 @@ def vk_send(peer_id, text, reply_to_msg=None):
     несколькими сообщениями (split_message). В беседах reply делается через
     параметр forward с conversation_message_ids: reply_to там не работает, потому что id = 0.
     """
-    for i, part in enumerate(split_message(text)):
+    if _terminal_output is not None:
+        print(text, file=_terminal_output, flush=True)
+        return
+    prefix = SYSTEM_MARK + " "
+    if text.startswith(prefix):
+        # Каждая часть справки/списка внимания остаётся служебной и после загрузки из ВК.
+        parts = [prefix + part for part in split_message(text[len(prefix):], VK_MESSAGE_LIMIT - len(prefix))]
+    else:
+        parts = split_message(text)
+    for i, part in enumerate(parts):
         params = dict(peer_ids=str(peer_id), message=part,
                       random_id=int(time.time() * 1000) % (2 ** 31) + i)
         if reply_to_msg and i == 0:
@@ -911,7 +921,8 @@ def tokens_limit(peer_id):
         log.info("peer=%s: лимит токенов %d (задан %s) вернулся к стандарту %d", peer_id, value,
                  fmt_ts(set_ts), MAX_TOKENS_DEFAULT)
         try:
-            send_system(peer_id, f"Прошло {TOKEN_LIMIT_RESET_MINUTES} мин с «/лимит токенов {value}» "
+            with output_to_terminal(None if db_state_get(f"tokens_terminal_{peer_id}") != "1" else sys.stdout):
+                send_system(peer_id, f"Прошло {TOKEN_LIMIT_RESET_MINUTES} мин с «/лимит токенов {value}» "
                                  f"(задан в {datetime.fromtimestamp(set_ts):%H:%M}) — лимит токенов "
                                  f"вернулся к стандарту {MAX_TOKENS_DEFAULT}.")
         except Exception as e:
@@ -947,8 +958,26 @@ def parse_limit_value(arg):
 
 
 def chars_limit(peer_id):
-    """Лимит символов истории в запросе к LLM для беседы."""
-    return _limit_get(f"chars_{peer_id}", MAX_CONTEXT_CHARS)[0]
+    """Временная надстройка не меняет заданный админом базовый лимит."""
+    base = _limit_get(f"chars_{peer_id}", MAX_CONTEXT_CHARS)[0]
+    raw = db_state_get(f"autochars_{peer_id}")
+    if raw:
+        value, until = raw.split("|")
+        if now() < float(until):
+            return max(base, int(value))
+        db_state_del(f"autochars_{peer_id}")
+        log.debug("peer=%s: лимит символов вернулся к %d", peer_id, base)
+    return base
+
+
+def grow_chars(peer_id, required):
+    """Только явная команда запускает/продлевает минуту; чтение лимита её не продлевает."""
+    base = _limit_get(f"chars_{peer_id}", MAX_CONTEXT_CHARS)[0]
+    if required > base:
+        value = min(max(required, chars_limit(peer_id)), MAX_CONTEXT_CHARS_CAP)
+        db_state_set(f"autochars_{peer_id}", f"{value}|{now() + AUTO_CHARS_SECONDS}")
+        log.debug("peer=%s: временный лимит %d, база %d, требуется %d", peer_id, value, base, required)
+
 
 
 def day_key(t=None):
@@ -1090,6 +1119,115 @@ def find_stored_message(peer_id, msg):
     return None
 
 
+def interval_rows(peer_id, start, end):
+    """Весь включительный временной интервал, без ограничения числа сообщений."""
+    return _rows(DB.execute(
+        "SELECT id,from_id,is_bot,text,ts,images FROM messages "
+        f"WHERE peer_id=? AND ts BETWEEN ? AND ? AND {NOT_SYSTEM_SQL} ORDER BY ts,id",
+        (peer_id, start, end, SYSTEM_MARK + "%")).fetchall())
+
+
+@traced
+def sync_interval_history(peer_id, start):
+    """Загружаем страницы до начала интервала, заполняя и пропуски внутри локальной БД."""
+    offset = 0
+    while True:
+        try:
+            items = vk.messages.getHistory(peer_id=peer_id, count=200, offset=offset)["items"]
+        except Exception as e:
+            log.warning("peer=%s: не удалось проверить полноту интервала: %s", peer_id, e)
+            return False
+        log.debug("peer=%s: история интервала offset=%d, получено=%d", peer_id, offset, len(items))
+        authors = set()
+        for message in items:
+            collect_author_ids(message, authors)
+        ensure_names(authors)
+        for message in reversed(items):
+            store_vk_message(peer_id, message)
+        offset += len(items)
+        if len(items) < 200 or min(message.get("date", 0) for message in items) < start:
+            return True
+
+
+def interval_bound(peer_id, message):
+    """Строгая привязка к этой беседе: не используем нечёткий поиск старого автоконтекста."""
+    if message.get("peer_id", peer_id) != peer_id:
+        return None
+    ts, author = message.get("date"), message.get("from_id")
+    if not ts or not author:
+        return None
+    candidates = DB.execute(
+        "SELECT id,ts,cmid,text FROM messages WHERE peer_id=? AND from_id=? AND ts=?",
+        (peer_id, author, ts)).fetchall()
+    body = render_message(message)[0].strip()
+    for rid, stamp, cmid, text in candidates:
+        if message.get("conversation_message_id") and message["conversation_message_id"] != cmid:
+            continue
+        if body and body not in (text or ""):
+            continue
+        return rid, stamp
+    return None
+
+
+@traced
+def cmd_interval(req):
+    targets = req.message.get("fwd_messages") or []
+    valid = (len(targets) == 2 and all(target.get("date") and target.get("from_id")
+             and target.get("peer_id", req.peer_id) == req.peer_id for target in targets))
+    if valid and not sync_interval_history(req.peer_id, min(target["date"] for target in targets)):
+        send_system(req.peer_id, "Не удалось загрузить полную историю интервала из ВК. "
+                    "Интервал не изменён; повторите команду после восстановления связи.",
+                    reply_to_msg=req.message)
+        return
+    bounds = [interval_bound(req.peer_id, target) for target in targets] if valid else []
+    if len(bounds) != 2 or not all(bounds) or bounds[0][0] == bounds[1][0]:
+        send_system(req.peer_id, "Нужны ровно два разных пересланных сообщения из истории этой беседы. "
+                    "Интервал не изменён.", reply_to_msg=req.message)
+        return
+    start, end = sorted(bound[1] for bound in bounds)
+    rows = interval_rows(req.peer_id, start, end)
+    db_state_set(f"interval_{req.peer_id}", json.dumps([start, end]))
+    grow_chars(req.peer_id, _size(context_lines(rows)) + len(attention_text(req.peer_id)))
+    log.debug("peer=%s: выбран интервал %s..%s, сообщений %d", req.peer_id, start, end, len(rows))
+    send_system(req.peer_id, f"Контекст с {fmt_ts(start)} по {fmt_ts(end)}: {len(rows)} сообщений. "
+                "Использую только со следующим обращением к боту; затем вернётся обычный контекст. "
+                "Отменить: «/сброс контекста».", reply_to_msg=req.message)
+
+
+def attention_messages(peer_id):
+    return json.loads(db_state_get(f"attention_{peer_id}", "[]"))
+
+
+def attention_text(peer_id):
+    return "\n".join(format_line(pin["from_id"], False, pin["text"], pin["ts"])
+                     for pin in attention_messages(peer_id))
+
+
+@traced
+def cmd_attention(req, arg):
+    peer_id = req.peer_id
+    pins = attention_messages(peer_id)
+    targets = req.message.get("fwd_messages") or []
+    if (arg or "").lower() == "сброс":
+        db_state_del(f"attention_{peer_id}")
+        send_system(peer_id, "Внимание сброшено.", reply_to_msg=req.message)
+        return
+    if targets:
+        for target in targets:
+            text, images = render_message(target)
+            pin = dict(from_id=target.get("from_id", 0), ts=target.get("date") or int(now()),
+                       text=text, images=images)
+            if pin not in pins and (text or images):
+                pins.append(pin)
+        db_state_set(f"attention_{peer_id}", json.dumps(pins, ensure_ascii=False))
+        context_note(peer_id, context_size(peer_id))
+        log.debug("peer=%s: сообщений внимания %d", peer_id, len(pins))
+    dates = "\n".join(f"• {fmt_ts(pin['ts'])} — {display_name(pin['from_id'])}" for pin in pins)
+    send_system(peer_id, (f"Внимание: {len(pins)} сообщений.\n{dates}\n"
+                         "Дополняю ими следующие ответы до «/внимание сброс»." if pins else
+                         "Внимание пусто. Перешлите сообщения с «/внимание»."), reply_to_msg=req.message)
+
+
 AUTOCTX_UNITS = (("м", 60), ("ч", 3600), ("д", 86400), ("сут", 86400), ("нед", 7 * 86400))
 
 
@@ -1139,6 +1277,8 @@ class Request:
         self.parts = 1                 # из скольких сообщений ВК собрано (длинное разрезано)
         self.last_part_ts = self.ts
         self.last_part_len = len(message.get("text") or "")
+        self.interval = None          # снимок интервала только для этого обращения
+        self.terminal_stream = None
         self.note = ""                 # пояснение к ответу на команду
 
     def add_part(self, part):
@@ -1169,6 +1309,12 @@ def enqueue(req):
     if not st.pending:
         st.first_pending_ts = t
     st.last_pending_ts = t
+    if not req.command:
+        raw = db_state_get(f"interval_{req.peer_id}")
+        if raw:
+            req.interval = json.loads(raw)
+            db_state_del(f"interval_{req.peer_id}")
+            log.debug("peer=%s: интервал закреплён за запросом %s", req.peer_id, req.rowid)
     st.pending.append(req)
 
 
@@ -1251,7 +1397,7 @@ def buffer_may_continue(cmd, text, message):
     if cmd[0] == "роль":
         role = extract_role(text)
         return bool(role) and (role[1] is False or (role[1] is None and len(text) >= SPLIT_MIN_PART_CHARS))
-    if cmd[0] == "запомни":
+    if cmd[0] in ("запомни", "запомни с нуля"):
         return (not message.get("fwd_messages") and not message.get("reply_message")
                 and len(text) >= SPLIT_MIN_PART_CHARS)
     return False
@@ -1302,7 +1448,7 @@ def finish_buffer(peer_id, from_id):
             req.note += " Закрывающая скобка так и не пришла — роль взята целиком до конца сообщения."
     else:
         m = REMEMBER_RE.search(text)
-        req.command = ("запомни", text[m.end():].strip() if m else text)
+        req.command = (req.command[0], text[m.end():].strip() if m else text)
     try:
         run_command(req)
     except Exception as e:
@@ -1313,15 +1459,24 @@ def finish_buffer(peer_id, from_id):
 def flush(peer_id):
     st = peer_state(peer_id)
     items, st.pending = st.pending, []
+    batch = []
     for req in items:
-        if req.command:
+        if req.command or req.interval:
+            if batch:
+                answer_batch(peer_id, batch)
+                batch = []
             try:
-                run_llm_command(req)
+                if req.command:
+                    with output_to_terminal(req.terminal_stream):
+                        run_llm_command(req)
+                else:
+                    answer_batch(peer_id, [req])
             except Exception as e:
-                log.exception("команда %s: %s", req.command[0], e)
-    msgs = [r for r in items if not r.command]
-    if msgs:
-        answer_batch(peer_id, msgs)
+                log.exception("запрос %s: %s", req, e)
+        else:
+            batch.append(req)
+    if batch:
+        answer_batch(peer_id, batch)
 
 
 # ============ LLM ============
@@ -1764,7 +1919,18 @@ def ask_gran(peer_id, requests, context_rows, images=(), fragments=None):
     system = build_system_prompt(db_get_role(peer_id))
     if fragments:
         system += "\n\n" + rag.CHAT_RULES
-    ctx = build_history(peer_id, context_rows, chars_limit(peer_id))
+    # Явно выбранный интервал не сжимаем, даже если минутная надстройка уже истекла.
+    budget = chars_limit(peer_id)
+    raw_budget = db_state_get(f"autochars_{peer_id}")
+    if raw_budget:
+        _, until = raw_budget.split("|")
+        required = _size(context_lines(context_rows)) + len(attention_text(peer_id))
+        budget = min(max(budget, required), MAX_CONTEXT_CHARS_CAP)
+        db_state_set(f"autochars_{peer_id}", f"{budget}|{until}")  # срок не продлеваем
+    ctx = ("\n".join(line for _, line in context_lines(context_rows))
+           if any(r.interval for r in requests)
+           else build_history(peer_id, context_rows, budget))
+    pins = attention_text(peer_id)
     log.debug("КОНТЕКСТ peer=%s:\n%s", peer_id, ctx)
 
     history = f"ИСТОРИЯ:\n{ctx}\n\n" if ctx else "Истории нет — это первое сообщение.\n\n"
@@ -1779,7 +1945,8 @@ def ask_gran(peer_id, requests, context_rows, images=(), fragments=None):
         "Ниже история чата (старые сообщения сверху, новые снизу)"
         + (", фрагменты базы знаний" if fragments else "") + " и новые "
         "сообщения, на которые надо ответить.\n\n"
-        f"{history}{knowledge}{task}"
+        f"{history}" + (f"ВНИМАНИЕ (закреплённые сообщения):\n{pins}\n\n" if pins else "")
+        + f"{knowledge}{task}"
         + ("К запросу приложены картинки из новых сообщений и последних сообщений истории.\n\n"
            if images else "")
         + ("Ответь как Грань, только по фрагментам базы знаний (с номерами фрагментов), "
@@ -1896,9 +2063,10 @@ def parse_start_time(s, t=None):
     return int(dt.timestamp())
 
 
-SPLIT_COMMANDS = {"роль", "запомни"}    # их текст может прийти несколькими сообщениями
+SPLIT_COMMANDS = {"роль", "запомни", "запомни с нуля"}    # их текст может прийти несколькими сообщениями
 RESET_ROLE_RE = re.compile(r"(?:^|\s)/сбросить\s+роль\b", re.IGNORECASE)
-REMEMBER_RE = re.compile(r"\bгрань\b[\s,.:!—-]*запомни\b|(?:^|\s)/запомни\b", re.IGNORECASE)
+REMEMBER_RE = re.compile(r"(?:\bгрань\b[\s,.:!—-]*запомни\b|(?:^|\s)/запомни\b)"
+                         r"(?P<reset>\s+с\s+нуля\b)?", re.IGNORECASE)
 RAG_RE = re.compile(r"(?<![\w/])(/?)(раг|rag)(?!\w)", re.IGNORECASE)
 RAG_MODE_RE = re.compile(r"(вкл(?:ючить|ючи)?|on|выкл(?:ючить|ючи)?|off)[\s.!]*", re.IGNORECASE)
 _ON_OFF = r"(?:\s*[:=]?\s*(вкл\w*|выкл\w*|on|off))?"
@@ -1918,6 +2086,7 @@ COMMAND_PATTERNS = [
     ("сброс контекста", re.compile(r"(?:^|\s)/сброс(?:ить)?\s+контекст[аы]?\b(?:\s*[:=]?\s*(\d+))?",
                                    re.IGNORECASE)),
     ("автоконтекст", re.compile(r"(?:^|\s)/авто-?\s*контекст\b(.*)", re.IGNORECASE)),
+    ("внимание", re.compile(r"(?:^|\s)/внимание\b(?:\s+(сброс))?", re.IGNORECASE)),
     ("контекст", re.compile(r"(?:^|\s)/контекст\b(?:\s*[:=]?\s*(\d+|сброс|стандарт))?", re.IGNORECASE)),
     ("рассуждения", re.compile(r"(?:^|\s)/рассуждени[яе]\b" + _ON_OFF, re.IGNORECASE)),
 ]
@@ -1958,7 +2127,7 @@ def parse_command(text, addressed=True):
         return ("роль", role[0] or None)    # None — показать текущую роль
     m = REMEMBER_RE.search(text)
     if m:
-        return ("запомни", text[m.end():].strip())
+        return ("запомни с нуля" if m.group("reset") else "запомни", text[m.end():].strip())
     rag_cmd = parse_rag(text, addressed)
     if rag_cmd:
         return rag_cmd
@@ -2033,7 +2202,13 @@ HELP = [
      f"«{REASONING_MARK}»" + ("" if REASONING_DEFAULT else "; по умолчанию выключены")),
     ("запомни", "«Грань, запомни» + пересланные сообщения (или текст после «запомни»)",
      "админ" if REMEMBER_ADMIN_ONLY else "все",
-     f"перезаписать {REMEMBER_FILE} в базе знаний и переиндексировать его"),
+     f"дописать {REMEMBER_FILE} в базе знаний и переиндексировать его"),
+    ("запомни с нуля", "«Грань, запомни с нуля» + сообщения или текст", "админ" if REMEMBER_ADMIN_ONLY else "все",
+     f"заменить {REMEMBER_FILE} целиком; пустой ввод файл не стирает"),
+    ("интервал", "/контекст + ровно 2 пересланных сообщения этой беседы", "все",
+     "весь интервал между датами включительно — только со следующим обращением; затем обычный контекст"),
+    ("внимание", "/внимание + пересланные сообщения", "все",
+     "добавить сообщения к контексту последующих ответов; /внимание — даты, /внимание сброс — очистить"),
     ("роль", "/роль (текст)", "все", "задать боту роль в этой беседе; «/роль» — показать текущую"),
     ("сбросить роль", "/сбросить роль", "все", f"вернуть роль по умолчанию (файл {ROLE_FILE})"),
     ("помощь", "/помощь", "все", "этот список и текущие настройки беседы"),
@@ -2077,6 +2252,10 @@ def help_text(peer_id):
             if tokens_reset_at(peer_id) else ""),
         f"• лимит символов истории: {chars_limit(peer_id)}",
         f"• контекст: {context_text(peer_id)}",
+        "• интервал для следующего обращения: " + ("задан" if db_state_get(f"interval_{peer_id}") else "нет"),
+        f"• сообщений внимания: {len(attention_messages(peer_id))}",
+        "• после команд контекста/внимания лимит символов при необходимости растёт на 60 с",
+        "• терминал: /чаты, /чат peer_id; команды без пересылок; ответы остаются в терминале",
         f"• база знаний в ответах (/раг вкл): {'да' if rag_mode(peer_id) else 'нет'}; "
         f"фрагментов в запрос: до {chunks_limit(peer_id)}",
         f"• рассуждения: {on_off(reasoning_enabled(peer_id))}",
@@ -2092,7 +2271,7 @@ def needs_admin(cmd):
     name, arg = cmd
     if name in ADMIN_COMMANDS:
         return True
-    if name == "запомни":
+    if name in ("запомни", "запомни с нуля"):
         return REMEMBER_ADMIN_ONLY
     return name == "пересказ" and (arg[0] or SUMMARY_DEFAULT_COUNT) > SUMMARY_FREE_MAX
 
@@ -2111,8 +2290,8 @@ def run_command(req):
     peer_id, message = req.peer_id, req.message
     name, arg = req.command
 
-    allowed = can_stop(peer_id, req.from_id) if name == "стоп" else (
-        not needs_admin(req.command) or is_admin(peer_id, req.from_id))
+    allowed = req.terminal_stream is not None or (can_stop(peer_id, req.from_id) if name == "стоп" else (
+        not needs_admin(req.command) or is_admin(peer_id, req.from_id)))
     if not allowed:
         what = (f"Пересказ больше {SUMMARY_FREE_MAX} сообщений доступен" if name == "пересказ"
                 else "Остановить бота может" if name == "стоп" else "Эта команда доступна")
@@ -2121,6 +2300,8 @@ def run_command(req):
                     reply_to_msg=message)
         return
 
+    if name == "лимит токенов" and arg is not None:
+        db_state_set(f"tokens_terminal_{peer_id}", "1" if req.terminal_stream is not None else "0")
     if name in LLM_COMMANDS:
         if is_paused(peer_id):
             enqueue(req)
@@ -2150,12 +2331,17 @@ def run_command(req):
         send_system(peer_id, f"Роль сброшена — действует роль по умолчанию"
                              f"{' (' + ROLE_FILE + ')' if os.path.exists(role_file_path()) else ''}.",
                     reply_to_msg=message)
-    elif name == "запомни":
-        cmd_remember(req, arg)
+    elif name in ("запомни", "запомни с нуля"):
+        cmd_remember(req, arg, reset=name == "запомни с нуля")
+    elif name == "внимание":
+        cmd_attention(req, arg)
     elif name == "забудь":
         # сбросить контекст беседы, история в БД остаётся
         db_state_set(f"forget_{peer_id}", req.ts + 1)
         db_state_del(f"ctxsum_{peer_id}")
+        db_state_del(f"interval_{peer_id}")
+        db_state_del(f"attention_{peer_id}")
+        db_state_del(f"autochars_{peer_id}")
         vk_send(peer_id, "Хорошо, начинаю с чистого листа.", reply_to_msg=message)
     elif name == "помощь":
         send_system(peer_id, help_text(peer_id), reply_to_msg=message)
@@ -2206,18 +2392,22 @@ def cmd_pause(req, arg):
 
 
 def context_note(peer_id, value):
-    """Предупреждение, если столько сообщений не влезет в лимит символов истории."""
+    """Поднимаем лимит на минуту, сохраняя ручную настройку."""
     rows = db_get_context(peer_id, value)
-    size = _size(context_lines(rows))
-    if size > chars_limit(peer_id):
-        return (f" Сейчас это ~{size} символов — больше лимита истории ({chars_limit(peer_id)}): "
-                "старая часть будет сжиматься в пересказ (поднять лимит: «/лимит символов N», админ).")
-    return ""
+    size = _size(context_lines(rows)) + len(attention_text(peer_id))
+    grow_chars(peer_id, size)
+    return (f" Лимит символов временно увеличен до {chars_limit(peer_id)} на 60 с."
+            if size > _limit_get(f"chars_{peer_id}", MAX_CONTEXT_CHARS)[0] else "")
 
 
 def cmd_context(req, arg):
     """/контекст — показать; /контекст N — задать; /контекст сброс — к стандарту."""
     peer_id = req.peer_id
+    if req.message.get("fwd_messages"):
+        cmd_interval(req)
+        return
+    if arg is not None:
+        db_state_del(f"interval_{peer_id}")
     if arg is None:
         send_system(peer_id, f"Контекст: {context_text(peer_id)}. Изменить: «/контекст N», "
                              "по пересланному сообщению или за период: «/автоконтекст», "
@@ -2287,6 +2477,7 @@ def cmd_reset_context(req, arg):
     """/сброс контекста — отменить автоконтекст; /сброс контекста N — сразу задать N."""
     peer_id = req.peer_id
     db_state_del(f"autoctx_{peer_id}")
+    db_state_del(f"interval_{peer_id}")
     db_state_del(f"ctxsum_{peer_id}")
     if arg:
         set_context(peer_id, "ctx", int(arg))
@@ -2327,6 +2518,8 @@ def cmd_limit(req, arg, key, title, default, cap, getter):
                              f"Изменить: «/лимит {word} N», вернуть стандарт: «… сброс».",
                     reply_to_msg=req.message)
         return
+    if key == "chars":
+        db_state_del(f"autochars_{peer_id}")
     number = parse_limit_value(arg)
     if number is None:
         db_state_del(f"{key}_{peer_id}")
@@ -2547,20 +2740,22 @@ def remember_content(req, text_arg):
 
 
 @traced
-def cmd_remember(req, text_arg):
-    """«Грань, запомни» + пересланное: перезаписать RAG/Рефлексия.txt и переиндексировать его."""
+def cmd_remember(req, text_arg, reset=False):
+    """Атомарная запись: дописать по умолчанию, заменить только по «с нуля»."""
     peer_id = req.peer_id
     content = remember_content(req, text_arg)
     if not content:
         send_system(peer_id, f"Что запомнить? Перешлите сообщения с текстом «Грань, запомни» "
-                             f"(или напишите текст после «запомни») — он заменит {REMEMBER_FILE} "
+                             f"(или напишите текст после «запомни») — он дополнит {REMEMBER_FILE} "
                              "в базе знаний.", reply_to_msg=req.message)
         return
     os.makedirs(RAG_DIR, exist_ok=True)
     path = os.path.join(RAG_DIR, REMEMBER_FILE)
     tmp = path + ".tmp"
+    previous = read_text_file(path) if os.path.exists(path) and not reset else ""
+    combined = (previous.rstrip() + "\n" if previous else "") + content.rstrip() + "\n"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content.rstrip() + "\n")
+        f.write(combined)
     if os.path.exists(path):
         os.replace(path, path + ".bak")       # прежняя версия — на всякий случай
     os.replace(tmp, path)
@@ -2571,9 +2766,10 @@ def cmd_remember(req, text_arg):
         send_system(peer_id, f"{REMEMBER_FILE} записан ({len(content)} символов), но переиндексировать "
                              f"не удалось: {e}", reply_to_msg=req.message)
         return
-    log.info("peer=%s: %s перезаписан (%d символов, %d фрагментов) от %s", peer_id, REMEMBER_FILE,
+    action = "перезаписан" if reset else "дополнен"
+    log.info("peer=%s: %s %s (%d символов, %d фрагментов) от %s", peer_id, REMEMBER_FILE, action,
              len(content), chunks, req.from_id)
-    send_system(peer_id, f"Запомнила: {REMEMBER_FILE} перезаписан ({len(content)} символов, "
+    send_system(peer_id, f"Запомнила: {REMEMBER_FILE} {action} ({len(content)} символов, "
                          f"{chunks} фрагментов в базе знаний).", reply_to_msg=req.message)
 
 
@@ -2624,8 +2820,11 @@ def answer_batch(peer_id, requests):
         ctx_rows = db_get_context(peer_id, size, since_ts=since,
                                   min_rows=CONTEXT_MIN_MESSAGES, exclude_ids=exclude,
                                   after_ts=forget_ts)
-        # картинки: из новых сообщений, затем из самых свежих сообщений истории
+        if last.interval:
+            ctx_rows = interval_rows(peer_id, *last.interval)
+        # картинки: из новых сообщений, внимания, затем из последних сообщений истории
         images = [u for r in requests for u in r.images]
+        images.extend(u for pin in attention_messages(peer_id) for u in pin["images"])
         for row in reversed(ctx_rows):
             if len(images) >= MAX_IMAGES_PER_REQUEST:
                 break
@@ -2672,7 +2871,8 @@ def handle_message(message):
             return
         finish_buffer(peer_id, from_id)
     # …и продолжение длинного обращения, которое ещё ждёт ответа
-    if not starts_command:
+    # Выбор нового интервала отделяет следующий вопрос от старого длинного запроса.
+    if not starts_command and not db_state_get(f"interval_{peer_id}"):
         cont = find_continuation(st, from_id, ts)
         if cont:
             cont.add_part(part)
@@ -2719,9 +2919,10 @@ def handle_event(event):
 
 # ============ Main ============
 def load_env():
-    """.env рядом с ботом, затем в текущей папке, затем от bot6 и bot5 (если переходим с них)."""
+    """.env рядом с ботом, затем в текущей папке, затем от bot7, bot6 и bot5."""
     from dotenv import load_dotenv
-    for path in (os.path.join(BOT_DIR, ".env"), None, os.path.join(BOT_DIR, "..", "bot6", ".env"),
+    for path in (os.path.join(BOT_DIR, ".env"), None, os.path.join(BOT_DIR, "..", "bot7", ".env"),
+                 os.path.join(BOT_DIR, "..", "bot6", ".env"),
                  os.path.join(BOT_DIR, "..", "bot5", ".env")):
         if path is None:
             load_dotenv()
@@ -2742,7 +2943,7 @@ def init():
     VK_USER_TOKEN = os.getenv("VK_USER_TOKEN") or None
     ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS") or "")}
     DB = db_init(DB_PATH)
-    migrate_from_bot6()
+    migrate_from_bot7()
     if not os.path.exists(role_file_path()):
         log.info("Файла роли %s нет — роль по умолчанию из DEFAULT_ROLE", role_file_path())
     default_role()
@@ -2765,26 +2966,84 @@ def _graceful_signal(signum, frame):
     STOP_REQUESTED = True
 
 
+@contextmanager
+def output_to_terminal(stream):
+    """Весь вывод команды, включая служебные уведомления, идёт в её исходный канал."""
+    global _terminal_output
+    previous = _terminal_output
+    if stream is not None:
+        _terminal_output = stream
+    try:
+        yield
+    finally:
+        _terminal_output = previous
+
+
+def execute_terminal(line, stream=None):
+    """Вызывается только главным потоком. Локальный оператор имеет права администратора."""
+    global TERMINAL_PEER, STOP_REQUESTED
+    stream = sys.stdout if stream is None else stream
+    line = line.strip()
+    if not line:
+        return
+    with output_to_terminal(stream):
+        if line == "0" or is_stop_request(line):
+            print("Останавливаюсь.", file=stream, flush=True)
+            STOP_REQUESTED = True
+            return
+        peers = [row[0] for row in DB.execute(
+            "SELECT DISTINCT peer_id FROM messages ORDER BY peer_id")]
+        if line == "/чаты":
+            print("Беседы (peer_id): " + ", ".join(map(str, peers)), file=stream, flush=True)
+            return
+        if line.startswith("/чат "):
+            value = line[5:].strip()
+            if not value.isdigit() or int(value) <= 0:
+                print("Формат: /чат peer_id (положительное число).", file=stream, flush=True)
+                return
+            TERMINAL_PEER = int(value)
+            print(f"Выбрана беседа {TERMINAL_PEER}.", file=stream, flush=True)
+            return
+        peer = TERMINAL_PEER if TERMINAL_PEER is not None else (peers[0] if len(peers) == 1 else None)
+        if peer is None:
+            print("Выберите беседу: /чаты, затем /чат peer_id.", file=stream, flush=True)
+            return
+        cmd = parse_command(line)
+        if cmd is None:
+            print("Неизвестная команда. /помощь — список команд; /чаты, /чат peer_id — выбор беседы.",
+                  file=stream, flush=True)
+            return
+        req = Request(dict(peer_id=peer, from_id=0, date=int(now()), text=line), command=cmd)
+        req.terminal_stream = stream
+        run_command(req)
+
+
+def process_terminal_commands():
+    while True:
+        try:
+            line = TERMINAL_LINES.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            execute_terminal(line)
+        except Exception as e:
+            log.exception("терминал: %s", e)
+            print(f"Ошибка команды: {e}", flush=True)
+        if STOP_REQUESTED:
+            break
+
+
 def terminal_stop_listener(stream=None):
-    """Поток-демон (TERMINAL_STOP): «0» + Enter в терминале, где запущен бот, — остановка,
-    как «Грань, стоп машина». Ввода нет (systemd, nohup, перенаправление из файла или
-    /dev/null) — поток просто завершается. Под bot8_server.py бот читает терминал сервера."""
-    global STOP_REQUESTED
-    stream = stream or sys.stdin
+    """Поток читает stdin без доступа к SQLite/ВК; выполнение — в главном цикле."""
+    stream = sys.stdin if stream is None else stream
     try:
         while not STOP_REQUESTED:
             line = stream.readline()
             if not line:
-                log.debug("терминал: ввод закрыт — остановка «0» недоступна")
                 return
-            if line.strip() == "0":
-                log.info("Команда остановки из терминала («0»)")
-                STOP_REQUESTED = True
-                return
-            if line.strip():
-                log.info("Терминал: для остановки бота введите 0 и нажмите Enter")
-    except Exception as e:      # stdin закрыт или недоступен
-        log.debug("терминал: %s — остановка «0» недоступна", e)
+            TERMINAL_LINES.put(line)
+    except (OSError, ValueError) as e:
+        log.debug("терминал недоступен: %s", e)
 
 
 def start_terminal_stop():
@@ -2803,8 +3062,8 @@ def parse_args(argv=None):
     ap.add_argument("--restart-after-hours", type=float, default=0,
                     help=f"проработав столько часов, выйти с кодом {RESTART_EXIT_CODE} для перезапуска "
                          "(его делает bot8_server.py); выход — когда никто не ждёт ответа")
-    ap.add_argument("--no-terminal-stop", action="store_true",
-                    help="не читать терминал (без остановки по «0» + Enter)")
+    ap.add_argument("--no-terminal-stop", "--no-terminal", action="store_true",
+                    help="не читать команды терминала (включая остановку «0»)")
     args = ap.parse_args(argv)
     args.debug = args.debug or os.getenv("BOT_DEBUG", "").strip().lower() in ("1", "true", "yes", "да")
     return args
@@ -2845,6 +3104,9 @@ def main(argv=None):
         if STOP_REQUESTED:
             break
         try:
+            process_terminal_commands()
+            if STOP_REQUESTED:
+                break
             process_pending()
         except Exception as e:
             log.exception("process_pending: %s", e)

@@ -183,7 +183,7 @@ def read_docx(path):
 
 def _doc_clean(text):
     """Спецсимволы Word: поля (код поля выбрасывается, результат остаётся), ячейки, разрывы."""
-    out, depth, in_code = [], 0, []
+    out, in_code = [], []
     for ch in text:
         if ch == "\x13":                       # начало поля: дальше код поля
             in_code.append(True)

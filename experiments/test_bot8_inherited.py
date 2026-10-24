@@ -1,9 +1,9 @@
 """
-Тесты новых возможностей bot8 (задача #17): размер контекста (/контекст, /автоконтекст,
+Тесты новых возможностей bot8 (задача #19, регрессии bot7): размер контекста (/контекст, /автоконтекст,
 /сброс контекста), режим базы знаний (/раг вкл|выкл, /лимит чанков), рассуждения модели
 (/рассуждения вкл|выкл), /мысль без повтора, остановка «0» из терминала и только админом.
 
-Запуск: python3 -m unittest experiments/test_bot8_new.py -v
+Запуск: python3 -m unittest experiments/test_bot8_inherited.py -v
 """
 import io
 import os
@@ -133,7 +133,7 @@ class TestContextCommands(Bot8Case):
 
     def test_help_mentions_context_commands(self):
         self.say("/помощь")
-        text = self.sent()[-1]
+        text = "\n".join(self.sent())
         for cmd in ("/контекст N", "/автоконтекст", "/сброс контекста", "/раг вкл", "/рассуждения вкл",
                     "/лимит чанков N"):
             self.assertIn(cmd, text)
@@ -452,6 +452,8 @@ class TestThoughtBot8(Bot8Case):
 class TestTerminalStop(Bot8Case):
     def test_zero_stops(self):
         bot8.terminal_stop_listener(io.StringIO("привет\n\n 0 \nещё\n"))
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            bot8.process_terminal_commands()
         self.assertTrue(bot8.STOP_REQUESTED)
 
     def test_other_input_and_eof_do_not_stop(self):
@@ -473,6 +475,8 @@ class TestTerminalStop(Bot8Case):
         with mock.patch.object(bot8.sys, "stdin", io.StringIO("0\n")):
             t = bot8.start_terminal_stop()
             t.join(5)
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            bot8.process_terminal_commands()
         self.assertTrue(bot8.STOP_REQUESTED)
 
     def test_cli_flag(self):

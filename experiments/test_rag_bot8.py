@@ -1,5 +1,5 @@
 """
-Тесты Прочее/bot8/rag.py (задача #17): весь набор experiments/test_rag.py (он же — для bot6)
+Тесты Прочее/bot8/rag.py (задача #19, регрессии bot7): весь набор experiments/test_rag.py (он же — для bot6)
 плюс новое в bot8 — format_fragments и CHAT_RULES для режима «/раг вкл».
 
 Запуск: python3 -m unittest experiments/test_rag_bot8.py -v
