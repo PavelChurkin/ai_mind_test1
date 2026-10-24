@@ -36,3 +36,10 @@ analyze.txt
 # bot7/ansible: адрес сервера и токены
 Прочее/bot7/ansible/inventory.ini
 Прочее/bot7/ansible/secrets.yml
+
+# bot8: runtime data and deployment secrets
+Прочее/bot8/logs/
+Прочее/bot8/RAG/
+Прочее/bot8/ansible/inventory.ini
+Прочее/bot8/ansible/secrets.yml
+ci-logs/
