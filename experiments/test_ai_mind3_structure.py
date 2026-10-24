@@ -123,7 +123,8 @@ def test_requirements_implementation():
     print("  ✓ Требование 9: Учёт родительских состояний при условиях - реализовано")
 
     # Требование 10: Асинхронная работа и остановка по "0"
-    assert 'async def main' in source or 'asyncio.run' in source, "Не найдена асинхронная работа"
+    # main() belongs to the module, not EmotionalMindV3's class source above.
+    assert inspect.iscoroutinefunction(ai_mind3.main), "Не найдена асинхронная работа"
     assert 'if user_input == "0"' in inspect.getsource(ai_mind3.main), "Не найдена проверка на выход"
     print("  ✓ Требование 10: Асинхронная работа и остановка по '0' - реализовано")
 
