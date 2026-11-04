@@ -564,7 +564,9 @@ class TestDefaultRole(Bot9Case):
 
     def test_role_file_shipped_with_bot(self):
         path = os.path.join(bot9.BOT_DIR, "Роль.txt")
-        self.assertEqual(bot9.read_text_file(path).strip(), bot9.DEFAULT_ROLE)
+        shipped = bot9.read_text_file(path).strip()
+        self.assertIn(bot9.ROLE_GROUP_PLACEHOLDER, shipped)     # название группы — из .env, не в файле
+        self.assertEqual(shipped.replace(bot9.ROLE_GROUP_PLACEHOLDER, bot9.GROUP_TITLE), bot9.DEFAULT_ROLE)
 
 
 # ---------- несколько собеседников: ждём 8 секунд ----------

@@ -1,5 +1,5 @@
 ---
-# Установка бота «Грань» (bot9) на чистый сервер с Linux (Debian/Ubuntu, а также RHEL/Rocky/Alma/Fedora).
+# Установка бота группы (bot9) на чистый сервер с Linux (Debian/Ubuntu, а также RHEL/Rocky/Alma/Fedora).
 #
 #   ansible-playbook -i inventory.ini playbook.yml -e @secrets.yml --ask-vault-pass
 #
@@ -8,12 +8,12 @@
 #   * создаёт системного пользователя bot9_user и папку bot9_home;
 #   * кладёт код бота: из этой папки (bot9_source: local) или клоном репозитория (bot9_source: git);
 #   * создаёт виртуальное окружение и ставит requirements.txt;
-#   * пишет .env с токенами (права 600) и, если указано, копирует книги в RAG;
+#   * пишет .env с токенами и названием группы (права 600) и, если указано, копирует книги в RAG и RAG2;
 #   * ставит службу systemd (bot9_server.py: перезапуск раз в bot9_restart_days суток с очисткой логов,
 #     после падения — systemd перезапускает) и запускает её.
 # Повторный запуск обновляет код и зависимости и перезапускает бота; база gran9.db, индекс
 # базы знаний и логи сохраняются.
-- name: Бот «Грань» (bot9)
+- name: Бот группы ВКонтакте (bot9)
   hosts: bot9
   become: true
   gather_facts: false
@@ -31,12 +31,15 @@
       - bot9_server.py
       - filosof.py
       - rag.py
+      - rag2.py
       - requirements.txt
       - nouns.json
       - verbs.json
       - adject.json
       - Роль.txt
+    bot9_group_name: грань        # название группы: на него откликается бот (GROUP_NAME в .env)
     bot9_rag_src: ""              # папка с книгами на машине, откуда запускается Ansible ("" — не копировать)
+    bot9_rag2_src: ""             # то же для базы знаний с пересказами (/раг2)
     bot9_restart_days: 7
     bot9_debug: false
     bot9_timezone: ""             # например Europe/Moscow ("" — не менять)
@@ -174,6 +177,17 @@
         mode: "0640"
         directory_mode: "0750"
       when: bot9_rag_src | length > 0
+      notify: Перезапустить бота
+
+    - name: Книги базы знаний с пересказами (RAG2)
+      ansible.builtin.copy:
+        src: "{{ bot9_rag2_src }}/"
+        dest: "{{ bot9_dir }}/RAG2/"
+        owner: "{{ bot9_user }}"
+        group: "{{ bot9_user }}"
+        mode: "0640"
+        directory_mode: "0750"
+      when: bot9_rag2_src | length > 0
       notify: Перезапустить бота
 
     - name: Служба systemd

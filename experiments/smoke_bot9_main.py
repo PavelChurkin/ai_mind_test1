@@ -138,7 +138,7 @@ class FakeOpenAI:
 vk_api.VkApi = FakeSession
 bl.VkBotLongPoll = FakeLongPoll
 openai.OpenAI = FakeOpenAI
-os.environ.update(VK_GROUP_ID="5", VK_TOKEN="x", PROXYAPI_KEY="x", ADMIN_IDS="7, 8")
+os.environ.update(VK_GROUP_ID="5", VK_TOKEN="x", PROXYAPI_KEY="x", ADMIN_IDS="7, 8", GROUP_NAME="грань")
 os.environ.pop("BOT_DEBUG", None)
 
 
@@ -149,6 +149,9 @@ def configure(bot9, d):
     bot9.OLD_DB_PATH = os.path.join(d, "нет_gran8.db")
     bot9.RAG_DIR = os.path.join(d, "RAG")
     bot9.RAG_INDEX_PATH = os.path.join(d, "rag_index.db")
+    bot9.RAG2_DIR = os.path.join(d, "RAG2")
+    bot9.RAG2_INDEX_PATH = os.path.join(d, "rag2_index.db")
+    bot9.RAG2_SUMMARY_INTERVAL_SEC = 0
     bot9.ROLE_FILE = os.path.join(d, "Роль.txt")
 
 

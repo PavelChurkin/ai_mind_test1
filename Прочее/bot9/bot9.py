@@ -26,11 +26,33 @@ if BOT_DIR not in sys.path:
     sys.path.insert(0, BOT_DIR)
 import filosof  # noqa: E402  (лежит рядом с ботом)
 import rag      # noqa: E402
+import rag2     # noqa: E402
+
+
+def load_env():
+    """.env рядом с ботом, затем в текущей папке, затем от bot8, bot7, bot6 и bot5."""
+    from dotenv import load_dotenv
+    for path in (os.path.join(BOT_DIR, ".env"), None, os.path.join(BOT_DIR, "..", "bot8", ".env"),
+                 os.path.join(BOT_DIR, "..", "bot7", ".env"),
+                 os.path.join(BOT_DIR, "..", "bot6", ".env"),
+                 os.path.join(BOT_DIR, "..", "bot5", ".env")):
+        if path is None:
+            load_dotenv()
+        elif os.path.exists(path):
+            load_dotenv(path)
+
+
+load_env()      # GROUP_NAME нужен уже настройкам ниже: от него зависят обращение, команды и подсказки
 
 # ============ НАСТРОЙКИ ============
-BOT_NAME = "Грань разумного"
-TRIGGER_RE = re.compile(r"\bгрань\b", re.IGNORECASE)
-STOP_PHRASE = "грань, стоп машина"   # остановка из чата — только админ (ADMIN_IDS или админ беседы)
+DEFAULT_GROUP_NAME = "грань"
+# Название группы (GROUP_NAME в .env) — обращение к боту и его имя; пробелы по краям и регистр неважны
+GROUP_NAME = " ".join((os.getenv("GROUP_NAME") or "").split()).lower() or DEFAULT_GROUP_NAME
+GROUP_TITLE = GROUP_NAME[:1].upper() + GROUP_NAME[1:]     # с заглавной: так бот подписан и называет себя
+GROUP_RE = r"(?<!\w)" + r"\s+".join(re.escape(w) for w in GROUP_NAME.split()) + r"(?!\w)"
+BOT_NAME = GROUP_TITLE
+TRIGGER_RE = re.compile(GROUP_RE, re.IGNORECASE)
+STOP_PHRASE = f"{GROUP_NAME}, стоп машина"   # остановка из чата — только админ (ADMIN_IDS или админ беседы)
 TERMINAL_STOP = True               # читать команды терминала, в том числе «0» для остановки
 
 # --- личные сообщения и права ---
@@ -77,6 +99,7 @@ SPLIT_MAX_PARTS = 20               # больше частей в одно об�
 ROLE_JOIN_SEC = 15                 # /роль без закрывающей скобки ждёт продолжения столько секунд
 
 # --- роль ---
+ROLE_GROUP_PLACEHOLDER = "{GROUP_NAME}"      # в файле роли заменяется на название группы
 ROLE_FILE = "Роль.txt"             # роль по умолчанию — файл рядом с ботом (нет файла — DEFAULT_ROLE)
 
 # --- база знаний (RAG) ---
@@ -92,8 +115,20 @@ RAG_EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
 RAG_NOTHING_FOUND = "В базе знаний ничего не нашлось."                 # «/раг вопрос» без находок
 RAG_MODE_DEFAULT = False           # режим «/раг вкл» в новой беседе
 RAG_NO_RESULT_PREFIX = "Поиск по базе знаний не дал результата."     # режим «/раг вкл»: начало ответа без находок
+# --- база знаний с пересказами (/раг2): векторы только от пересказов, в ответ — исходные фрагменты ---
+RAG2_DIR = os.path.join(BOT_DIR, "RAG2")   # отдельная папка с книгами, рядом с ботом
+RAG2_INDEX_PATH = os.path.join(BOT_DIR, "rag2_index.db")
+RAG2_CHUNK_CHARS = 2000            # размер фрагмента: чтобы пересказ из 3-4 предложений был короче него
+RAG2_CHUNK_OVERLAP = 200           # перекрытие соседних фрагментов
+RAG2_EMBEDDING_MODEL = "openai/text-embedding-3-small"  # через тот же ProxyAPI и PROXYAPI_KEY
+RAG2_DENSE_MIN_SIM = 0.3           # порог близости вопроса к пересказу (подбирать по своим книгам)
+RAG2_BUILD = True                  # False — не отправлять фрагменты в БЯМ (работает то, что уже посчитано)
+RAG2_SUMMARY_MAX_TOKENS = 500      # лимит ответа модели на один пересказ
+RAG2_SUMMARY_INTERVAL_SEC = 3      # пауза между пересказами
+RAG2_IDLE_POLL_SEC = 30            # как часто проверять очередь, когда она пуста
+RAG2_MAX_BACKOFF_SEC = 600         # самая долгая пауза после ошибок API
 REMEMBER_FILE = "Рефлексия.txt"    # «запомни» дописывает; «запомни с нуля» заменяет
-REMEMBER_ADMIN_ONLY = True         # «Грань, запомни» — только админ беседы (False — все)
+REMEMBER_ADMIN_ONLY = True         # «<Имя>, запомни» — только админ беседы (False — все)
 
 # --- дневной лимит ---
 DAILY_MESSAGE_LIMIT = 100          # ответов бота в сутки (0 — без лимита)
@@ -148,7 +183,7 @@ log = logging.getLogger("gran")
 DEBUG_MODE = False                 # --debug: подробный лог основных функций (setup_logging)
 
 DEFAULT_ROLE = (
-    "Ты — Грань, участник беседы. Общайся живо, по-человечески, "
+    f"Ты — {GROUP_TITLE}, участник беседы. Общайся живо, по-человечески, "
     "не будь слишком формальной, подстраивайся под тон беседы."
 )
 LIMIT_REACHED_TEXT = "Извините, сегодня лимит сообщений достигнут."
@@ -173,6 +208,7 @@ _admin_cache = {}                  # peer_id -> (когда загружен, {i
 PEERS = {}                         # peer_id -> PeerState: очередь обращений, пауза, недописанные команды
 FILOSOF = filosof.ThoughtGenerator()
 KB = None                          # база знаний rag.KnowledgeBase (get_kb)
+KB2 = None                         # база знаний rag2.SummaryKnowledgeBase главного потока (get_kb2)
 _image_cache = OrderedDict()       # url -> часть запроса с картинкой
 TERMINAL_LINES = queue.Queue()     # stdin-поток только кладёт строки; БД — в главном потоке
 TERMINAL_PEER = None
@@ -394,7 +430,7 @@ def default_role():
         return DEFAULT_ROLE
     if _role_file_cache[0] != (path, mtime):
         try:
-            text = read_text_file(path).strip()
+            text = read_text_file(path).strip().replace(ROLE_GROUP_PLACEHOLDER, GROUP_TITLE)
         except OSError as e:
             log.warning("%s: %s", path, e)
             text = ""
@@ -1291,7 +1327,7 @@ class Request:
         self.last_part_ts, self.last_part_len = part["ts"], part["len"]
 
     def prepend(self, parts):
-        """Предыдущие части: обращение («Грань, …») оказалось в последней части."""
+        """Предыдущие части: обращение («<Имя>, …») оказалось в последней части."""
         self.rowids = [p["rowid"] for p in parts if p["rowid"]] + self.rowids
         self.text = "\n".join([p["text"] for p in parts] + [self.text])
         self.images = [u for p in parts for u in p["images"]] + self.images
@@ -1373,7 +1409,7 @@ def chain_continues(chain, ts):
 
 
 def note_unaddressed_part(st, from_id, part):
-    """Длинное сообщение без обращения может оказаться началом обращения, у которого «Грань»
+    """Длинное сообщение без обращения может оказаться началом обращения, у которого название группы
     в последней части: запоминаем цепочку таких сообщений."""
     chain = st.chains.get(from_id)
     if chain_continues(chain, part["ts"]):
@@ -1826,6 +1862,10 @@ def reasoning_enabled(peer_id):
     return REASONING_DEFAULT if raw is None else raw == "1"
 
 
+def rag2_mode(peer_id):
+    return db_state_get(f"rag2_{peer_id}") == "1"
+
+
 def rag_mode(peer_id):
     raw = db_state_get(f"rag_{peer_id}")
     return RAG_MODE_DEFAULT if raw is None else raw == "1"
@@ -1907,8 +1947,8 @@ def strip_bot_extras(text):
 
 
 def clean_answer(text):
-    """Убирает «Грань разумного:» в начале, если модель подписалась."""
-    return re.sub(rf"^\s*(\[[^\]]*\]\s*)?({re.escape(BOT_NAME)}|Грань)\s*:\s*", "", text or "").strip()
+    """Убирает «<Имя>:» в начале, если модель подписалась."""
+    return re.sub(rf"^\s*(\[[^\]]*\]\s*)?{GROUP_RE}\s*:\s*", "", text or "", flags=re.IGNORECASE).strip()
 
 
 @traced
@@ -1949,8 +1989,8 @@ def ask_gran(peer_id, requests, context_rows, images=(), fragments=None):
         + f"{knowledge}{task}"
         + ("К запросу приложены картинки из новых сообщений и последних сообщений истории.\n\n"
            if images else "")
-        + ("Ответь как Грань, только по фрагментам базы знаний (с номерами фрагментов), "
-           f"или одним словом {rag.NO_ANSWER}." if fragments else "Ответь как Грань.")
+        + (f"Ответь как {GROUP_TITLE}, только по фрагментам базы знаний (с номерами фрагментов), "
+           f"или одним словом {rag.NO_ANSWER}." if fragments else f"Ответь как {GROUP_TITLE}.")
     )
     max_tokens = max(RAG_MAX_TOKENS, tokens_limit(peer_id)) if fragments else tokens_limit(peer_id)
     return clean_answer(llm_call(system, prompt, max_tokens=max_tokens, images=images))
@@ -1986,7 +2026,7 @@ def is_reply_to_bot(message):
 
 
 def is_addressed_to_bot(message):
-    """Обращение к боту: слово «грань», reply на сообщение бота или личка (если разрешена)."""
+    """Обращение к боту: название группы, reply на сообщение бота или личка (если разрешена)."""
     return (has_trigger(message.get("text"))
             or is_reply_to_bot(message)
             or (ALLOW_PRIVATE_MESSAGES and is_private(message.get("peer_id", 0))))
@@ -1997,7 +2037,7 @@ def should_respond(message_ts):
 
 
 ROLE_RE = re.compile(r"/роль(?!\w)", re.IGNORECASE)
-ADDRESS_PREFIX_RE = re.compile(r"\s*(?:грань\b[\s,.:!—-]*)?", re.IGNORECASE)
+ADDRESS_PREFIX_RE = re.compile(rf"\s*(?:{GROUP_RE}[\s,.:!—-]*)?", re.IGNORECASE)
 
 
 def extract_role(text):
@@ -2005,7 +2045,7 @@ def extract_role(text):
     Роль из «/роль (текст)» или «/роль текст»: (текст, закрыта) или None.
     закрыта: True — скобка закрыта; False — «(» без «)» (ВК разрезал длинную роль на
     несколько сообщений, продолжение — в следующих); None — форма без скобок (она только
-    в начале сообщения, можно после «Грань,»). «/роль» без текста — ("", None).
+    в начале сообщения, можно после «<Имя>,»). «/роль» без текста — ("", None).
     Скобки внутри роли допустимы: роль кончается последней «)», если она закрывает «(».
     """
     text = text or ""
@@ -2026,8 +2066,8 @@ def extract_role(text):
 
 def is_summary_request(text):
     low = (text or "").lower()
-    return ("грань, перескажи" in low) or ("грань, о чём тут" in low) \
-        or ("грань, о чем тут" in low)
+    return (f"{GROUP_NAME}, перескажи" in low) or (f"{GROUP_NAME}, о чём тут" in low) \
+        or (f"{GROUP_NAME}, о чем тут" in low)
 
 
 def is_stop_request(text):
@@ -2065,9 +2105,9 @@ def parse_start_time(s, t=None):
 
 SPLIT_COMMANDS = {"роль", "запомни", "запомни с нуля"}    # их текст может прийти несколькими сообщениями
 RESET_ROLE_RE = re.compile(r"(?:^|\s)/сбросить\s+роль\b", re.IGNORECASE)
-REMEMBER_RE = re.compile(r"(?:\bгрань\b[\s,.:!—-]*запомни\b|(?:^|\s)/запомни\b)"
+REMEMBER_RE = re.compile(rf"(?:{GROUP_RE}[\s,.:!—-]*запомни\b|(?:^|\s)/запомни\b)"
                          r"(?P<reset>\s+с\s+нуля\b)?", re.IGNORECASE)
-RAG_RE = re.compile(r"(?<![\w/])(/?)(раг|rag)(?!\w)", re.IGNORECASE)
+RAG_RE = re.compile(r"(?<![\w/])(/?)(раг2?|rag2?)(?!\w)", re.IGNORECASE)
 RAG_MODE_RE = re.compile(r"(вкл(?:ючить|ючи)?|on|выкл(?:ючить|ючи)?|off)[\s.!]*", re.IGNORECASE)
 _ON_OFF = r"(?:\s*[:=]?\s*(вкл\w*|выкл\w*|on|off))?"
 _NUMBER = r"\d(?:[\d \u00a0\u2009\u202f]*\d)?(?:\s*(?:к|k|тыс\.?))?(?!\w)"   # 3000, 30 000, 30к, 2k, 3 тыс
@@ -2093,19 +2133,20 @@ COMMAND_PATTERNS = [
 
 
 def parse_rag(text, addressed=True):
-    """«Грань, РАГ вопрос» / «/раг вопрос» → ("раг", вопрос); «/раг вкл» / «/раг выкл» →
-    ("раг режим", True/False); иначе None.
-    Без «/» слово должно быть написано заглавными («РАГ») или стоять сразу после «Грань,»,
+    """«<Имя>, РАГ вопрос» / «/раг вопрос» → ("раг", вопрос); «/раг вкл» / «/раг выкл» →
+    ("раг режим", True/False); иначе None. «РАГ2» / «/раг2» — то же: ("раг2", …), ("раг2 режим", …).
+    Без «/» слово должно быть написано заглавными («РАГ») или стоять сразу после «<Имя>,»,
     и сообщение должно быть обращением к боту — чтобы не срабатывать на случайное «раг»."""
     for m in RAG_RE.finditer(text):
         slash, word = m.group(1), m.group(2)
         after_name = bool(ADDRESS_PREFIX_RE.fullmatch(text[:m.start()])) and has_trigger(text[:m.start()])
         if slash or ((word.isupper() or after_name) and addressed):
             query = re.sub(r"^[\s,.:;!?+—-]+", "", text[m.end():]).strip()   # «РАГ+» — как «РАГ»
+            name = "раг2" if word.endswith("2") else "раг"
             mode = RAG_MODE_RE.fullmatch(query)
             if mode:
-                return ("раг режим", is_on(mode.group(1)))
-            return ("раг", query)
+                return (f"{name} режим", is_on(mode.group(1)))
+            return (name, query)
     return None
 
 
@@ -2149,7 +2190,7 @@ def parse_command(text, addressed=True):
 
 
 def quoted_content(message):
-    """Текст и картинки reply/пересланных сообщений — для «грань, перескажи»."""
+    """Текст и картинки reply/пересланных сообщений — для «<имя>, перескажи»."""
     images, parts = [], []
     if message.get("reply_message"):
         parts.append(render_message(message["reply_message"], images)[0])
@@ -2165,9 +2206,9 @@ def quoted_content(message):
 # ============ Команды ============
 # (имя, как вызвать, кто может, что делает) — по этой таблице строится /помощь
 HELP = [
-    ("обращение", "«Грань, …» или reply на сообщение бота", "все",
+    ("обращение", f"«{GROUP_TITLE}, …» или reply на сообщение бота", "все",
      f"ответ бота; обращения за {BATCH_WAIT_SEC} с собираются и получают один общий ответ"),
-    ("перескажи", "«Грань, перескажи» / «Грань, о чём тут» (reply, пересланные или пост)", "все",
+    ("перескажи", f"«{GROUP_TITLE}, перескажи» / «{GROUP_TITLE}, о чём тут» (reply, пересланные или пост)", "все",
      "пересказ сообщения, на которое ответили, пересланных или поста"),
     ("пересказ", "/пересказ N", "все; больше "
      f"{SUMMARY_FREE_MAX} сообщений — админ", "пересказ последних N сообщений беседы"),
@@ -2191,19 +2232,25 @@ HELP = [
     ("сброс контекста", "/сброс контекста [N]", "все",
      "отменить автоконтекст: вернуться к заданному «/контекст» размеру (или стандарту); "
      "с числом — сразу задать N"),
-    ("раг", "«Грань, РАГ вопрос» или «/раг вопрос»", "все",
+    ("раг", f"«{GROUP_TITLE}, РАГ вопрос» или «/раг вопрос»", "все",
      f"разовый ответ строго по книгам из папки RAG (с источниками); если там ничего нет — "
      f"«{RAG_NOTHING_FOUND}», без выдумок; «/раг» без вопроса — что есть в базе знаний"),
     ("раг режим", "/раг вкл, /раг выкл", "все",
      "вкл — каждый ответ сначала ищется в базе знаний: нашлось — ответ только по фрагментам, "
      f"не нашлось — «{RAG_NO_RESULT_PREFIX}» и обычный ответ; выкл — ответы только по истории"),
+    ("раг2", f"«{GROUP_TITLE}, РАГ2 вопрос» или «/раг2 вопрос»", "все",
+     f"как /раг, но по книгам из папки RAG2: поиск идёт по пересказам фрагментов, а ответ — по самим "
+     f"фрагментам; «/раг2» без вопроса — состояние базы и сколько пересказов готово"),
+    ("раг2 режим", "/раг2 вкл, /раг2 выкл", "все",
+     "как /раг вкл и /раг выкл, но поиск по индексу пересказов; одновременно действует один режим: "
+     "/раг вкл и /раг2 вкл заменяют друг друга"),
     ("рассуждения", "/рассуждения вкл, /рассуждения выкл", "все",
      f"вкл — модель рассуждает перед ответом, рассуждение — в начале сообщения между строками "
      f"«{REASONING_MARK}»" + ("" if REASONING_DEFAULT else "; по умолчанию выключены")),
-    ("запомни", "«Грань, запомни» + пересланные сообщения (или текст после «запомни»)",
+    ("запомни", f"«{GROUP_TITLE}, запомни» + пересланные сообщения (или текст после «запомни»)",
      "админ" if REMEMBER_ADMIN_ONLY else "все",
      f"дописать {REMEMBER_FILE} в базе знаний и переиндексировать его"),
-    ("запомни с нуля", "«Грань, запомни с нуля» + сообщения или текст", "админ" if REMEMBER_ADMIN_ONLY else "все",
+    ("запомни с нуля", f"«{GROUP_TITLE}, запомни с нуля» + сообщения или текст", "админ" if REMEMBER_ADMIN_ONLY else "все",
      f"заменить {REMEMBER_FILE} целиком; пустой ввод файл не стирает"),
     ("интервал", "/контекст + ровно 2 пересланных сообщения этой беседы", "все",
      "весь интервал между датами включительно — только со следующим обращением; затем обычный контекст"),
@@ -2228,7 +2275,7 @@ HELP = [
      "остановить бота" + ("; или «0» и Enter в терминале, где запущен бот" if TERMINAL_STOP else "")),
 ]
 ADMIN_COMMANDS = {"лимит токенов", "лимит символов", "лимит чанков", "сбросить лимит", "стоп"}
-LLM_COMMANDS = {"пересказ", "мысль", "перескажи", "раг"}   # на паузе откладываются, расходуют лимит
+LLM_COMMANDS = {"пересказ", "мысль", "перескажи", "раг", "раг2"}   # на паузе откладываются, расходуют лимит
 
 
 def on_off(flag):
@@ -2236,7 +2283,7 @@ def on_off(flag):
 
 
 def help_text(peer_id):
-    lines = ["Команды бота «Грань»:", ""]
+    lines = [f"Команды бота «{GROUP_TITLE}»:", ""]
     for _name, usage, who, what in HELP:
         lines.append(f"• {usage} — {what}. Кто: {who}.")
     st = daily_state(peer_id)
@@ -2258,6 +2305,7 @@ def help_text(peer_id):
         "• терминал: /чаты, /чат peer_id; команды без пересылок; ответы остаются в терминале",
         f"• база знаний в ответах (/раг вкл): {'да' if rag_mode(peer_id) else 'нет'}; "
         f"фрагментов в запрос: до {chunks_limit(peer_id)}",
+        f"• база знаний с пересказами в ответах (/раг2 вкл): {'да' if rag2_mode(peer_id) else 'нет'}",
         f"• рассуждения: {on_off(reasoning_enabled(peer_id))}",
         "• ответов сегодня: " + (f"{st['count']} из {DAILY_MESSAGE_LIMIT}" if DAILY_MESSAGE_LIMIT > 0
                                  else f"{st['count']} (без лимита)"),
@@ -2353,15 +2401,22 @@ def run_command(req):
         cmd_autocontext(req, arg)
     elif name == "сброс контекста":
         cmd_reset_context(req, arg)
+    elif name == "раг2 режим":
+        cmd_rag2_mode(req, arg)
     elif name == "раг режим":
+        rag2_was_on = rag2_mode(peer_id)
         db_state_set(f"rag_{peer_id}", "1" if arg else "0")
+        if arg:
+            db_state_set(f"rag2_{peer_id}", "0")     # /раг вкл всегда ищет в первом индексе
         log.info("peer=%s: режим базы знаний %s (от %s)", peer_id, "вкл" if arg else "выкл", req.from_id)
         send_system(peer_id, (f"Режим базы знаний включён: каждый ответ сначала ищется в базе знаний "
                               f"(до {chunks_limit(peer_id)} фрагментов). Нашлось — отвечаю только по "
                               f"фрагментам, не нашлось — пишу «{RAG_NO_RESULT_PREFIX}» и отвечаю как "
                               "обычно. Выключить: «/раг выкл».") if arg else
-                    "Режим базы знаний выключен: отвечаю только по истории беседы. Разовый вопрос "
-                    "к базе знаний — «/раг вопрос».", reply_to_msg=message)
+                    ("Режим базы знаний выключен: отвечаю только по истории беседы. Разовый вопрос "
+                     "к базе знаний — «/раг вопрос»." if not rag2_was_on else
+                     "Режим /раг выключен, но продолжает действовать /раг2 вкл. Выключить его: «/раг2 выкл»."),
+                    reply_to_msg=message)
     elif name == "рассуждения":
         cmd_reasoning(req, arg)
     elif name == "лимит токенов":
@@ -2598,6 +2653,8 @@ def run_llm_command(req):
         cmd_summary(req, *arg)
     elif name == "раг":
         cmd_rag(req, arg)
+    elif name == "раг2":
+        cmd_rag(req, arg, sync=sync_kb2, status=rag2_status_text)
 
 
 # ============ База знаний ============
@@ -2630,51 +2687,198 @@ def sync_kb():
     return kb
 
 
-def rag_status_text(kb, peer_id):
-    st = kb.stats()
-    lines = [f"База знаний (папка {os.path.basename(RAG_DIR)} рядом с ботом): книг {st['ok']}, "
-             f"фрагментов {st['chunks']}" + (f", не прочитано файлов: {len(st['errors'])}" if st["errors"] else "")
-             + "."]
+def get_kb2():
+    """База знаний с пересказами (папка RAG2_DIR): открывается при первом обращении."""
+    global KB2
+    if KB2 is None:
+        KB2 = open_kb2()
+    return KB2
+
+
+def open_kb2():
+    """Новое соединение с индексом 2: своё у главного потока и у фонового построения пересказов."""
+    os.makedirs(RAG2_DIR, exist_ok=True)
+    return rag2.SummaryKnowledgeBase(
+        RAG2_DIR, RAG2_INDEX_PATH, summarize_fragment, rag2.ApiEmbedder(lambda: llm_client, RAG2_EMBEDDING_MODEL),
+        dense_min_sim=RAG2_DENSE_MIN_SIM, top_k=RAG_TOP_K, min_coverage=RAG_MIN_COVERAGE,
+        chunk_chars=RAG2_CHUNK_CHARS, overlap=RAG2_CHUNK_OVERLAP)
+
+
+def sync_kb2():
+    """Новые и изменённые книги папки RAG2 попадают в индекс сразу, пересказы досчитываются в фоне."""
+    kb = get_kb2()
+    changed, removed = kb.sync()
+    if changed or removed:
+        st = kb.stats()
+        log.info("База знаний РАГ2: изменено %d, удалено %d; книг %d, фрагментов %d, без пересказа %d, ошибок %d",
+                 changed, removed, st["ok"], st["chunks"], st["pending"], len(st["errors"]))
+        for path, error in st["errors"]:
+            log.warning("База знаний РАГ2: не прочитан %s: %s", path, error)
+    return kb
+
+
+def summarize_fragment(system, prompt):
+    """Пересказ фрагмента. Работает в фоновом потоке, поэтому обращается к API напрямую: llm_call
+    меняет общие для главного потока LLM_REASONINGS, LAST_LLM_ERROR и момент последнего запроса.
+    Рассуждения выключены: они не нужны пересказу и съели бы его лимит. Лимит ответов в день
+    не расходуется — пересказы строят базу знаний, а не отвечают людям."""
+    global REASONING_PARAM_OK
+    extra = dict(LLM_EXTRA_BODY or {})
+    thinking = REASONING_OFF_BODY if REASONING_PARAM_OK else None
+
+    def request(max_tokens, thinking):
+        body = dict(extra, **(thinking or {}))
+        resp = llm_client.chat.completions.create(
+            model=MODEL_NAME, max_tokens=max_tokens,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            **({"extra_body": body} if body else {}))
+        choice = resp.choices[0]
+        answer, _reasoning = extract_reasoning(choice.message, getattr(choice.message, "content", None))
+        return answer, getattr(choice, "finish_reason", None)
+
+    try:
+        answer, finish = request(RAG2_SUMMARY_MAX_TOKENS, thinking)
+    except Exception as e:
+        if not thinking or not is_param_error(e):
+            raise
+        log.warning("API отверг параметр %s (%s) — пересказ без него", thinking, shorten(str(e), 200))
+        thinking = None
+        answer, finish = request(RAG2_SUMMARY_MAX_TOKENS, thinking)
+        REASONING_PARAM_OK = False
+    if not answer and finish == "length":   # модель всё же рассуждала и исчерпала лимит
+        answer, finish = request(EMPTY_ANSWER_RETRY_TOKENS, thinking)
+    return answer
+
+
+def rag2_next_delay(pending, failures):
+    """Сколько секунд ждать до следующего шага; после ошибок подряд — 30 с, 60 с… до предела."""
+    if failures:
+        return min(30 * 2 ** (failures - 1), RAG2_MAX_BACKOFF_SEC)
+    return RAG2_SUMMARY_INTERVAL_SEC if pending else RAG2_IDLE_POLL_SEC
+
+
+def rag2_worker():
+    """Фоновое построение пересказов: долгие платные запросы не задерживают ответы в чате.
+    Прерванная работа продолжается после перезапуска. Файлы читает только главный поток (sync_kb2)."""
+    kb, delay, failures = None, 0, 0
+    while not STOP_REQUESTED:
+        if delay > 0:
+            time.sleep(min(delay, 1))
+            delay -= 1
+            continue
+        pending = 0
+        try:
+            kb = kb or open_kb2()
+            result = kb.process_pending(1)
+            pending = result["pending"]
+            failures = failures + 1 if result["failed"] else 0
+        except Exception as e:
+            failures += 1
+            log.exception("РАГ2: фоновое построение пересказов: %s", e)
+        delay = rag2_next_delay(pending, failures)
+    if kb is not None:
+        kb.close()
+
+
+def start_rag2_worker():
+    if not RAG2_BUILD:
+        return None
+    thread = threading.Thread(target=rag2_worker, name="rag2-worker", daemon=True)
+    thread.start()
+    return thread
+
+
+def rag_books_lines(kb):
+    lines = []
     books = kb.books()
     for path, title, chunks, error in books[:30]:
         lines.append(f"• {path} — «{title}», " + (f"не прочитан: {error}" if error else f"фрагментов {chunks}"))
     if len(books) > 30:
         lines.append(f"… и ещё {len(books) - 30}")
+    return lines
+
+
+def rag2_status_text(kb, peer_id):
+    st = kb.stats()
+    lines = [f"База знаний РАГ2 (папка {os.path.basename(RAG2_DIR)} рядом с ботом): книг {st['ok']}, "
+             f"фрагментов {st['chunks']}, с пересказом {st['summarized']}, в очереди {st['pending']}"
+             + (f", не прочитано файлов: {len(st['errors'])}" if st["errors"] else "") + "."]
+    if st["pending"]:
+        lines.append("Пока пересказы готовы не все, остальные фрагменты находятся только поиском по словам.")
+    if st["last_error"]:
+        lines.append(f"Последняя ошибка построения пересказов: {st['last_error']}")
+    lines += rag_books_lines(kb)
+    lines.append(f"Режим РАГ2 в этой беседе: {'включён' if rag2_mode(peer_id) else 'выключен'}, "
+                 f"фрагментов в запрос — до {chunks_limit(peer_id)}.")
+    lines.append(f"Разовый вопрос: «{GROUP_TITLE}, РАГ2 вопрос» или «/раг2 вопрос» (только по книгам). "
+                 "«/раг2 вкл» — все ответы с учётом этой базы знаний, «/раг2 выкл» — только по истории.")
+    return "\n".join(lines)
+
+
+def cmd_rag2_mode(req, on):
+    """«/раг2 вкл» / «/раг2 выкл»: как «/раг вкл», но поиск по индексу пересказов."""
+    peer_id = req.peer_id
+    db_state_set(f"rag2_{peer_id}", "1" if on else "0")
+    if on:
+        db_state_set(f"rag_{peer_id}", "0")
+    log.info("peer=%s: режим РАГ2 %s (от %s)", peer_id, "вкл" if on else "выкл", req.from_id)
+    if on:
+        text = (f"Режим РАГ2 включён: каждый ответ сначала ищется по пересказам книг из папки "
+                f"{os.path.basename(RAG2_DIR)} (до {chunks_limit(peer_id)} фрагментов). Нашлось — отвечаю только "
+                f"по исходным фрагментам, не нашлось — пишу «{RAG_NO_RESULT_PREFIX}» и отвечаю как обычно. "
+                "Выключить: «/раг2 выкл».")
+    elif rag_mode(peer_id):
+        text = "Режим РАГ2 выключен, но продолжает действовать /раг вкл. Выключить его: «/раг выкл»."
+    else:
+        text = ("Режим РАГ2 выключен: отвечаю только по истории беседы. Разовый вопрос к этой базе "
+                "знаний — «/раг2 вопрос».")
+    send_system(peer_id, text, reply_to_msg=req.message)
+
+
+def rag_status_text(kb, peer_id):
+    st = kb.stats()
+    lines = [f"База знаний (папка {os.path.basename(RAG_DIR)} рядом с ботом): книг {st['ok']}, "
+             f"фрагментов {st['chunks']}" + (f", не прочитано файлов: {len(st['errors'])}" if st["errors"] else "")
+             + "."]
+    lines += rag_books_lines(kb)
     lines.append(f"Режим базы знаний в этой беседе: {'включён' if rag_mode(peer_id) else 'выключен'}, "
                  f"фрагментов в запрос — до {chunks_limit(peer_id)}.")
-    lines.append("Разовый вопрос: «Грань, РАГ вопрос» или «/раг вопрос» (только по книгам). "
+    lines.append(f"Разовый вопрос: «{GROUP_TITLE}, РАГ вопрос» или «/раг вопрос» (только по книгам). "
                  "«/раг вкл» — все ответы с учётом базы знаний, «/раг выкл» — только по истории.")
     return "\n".join(lines)
 
 
-def kb_search(peer_id, query):
-    """Найденные фрагменты (не больше /лимит чанков). Ошибку базы знаний пробрасывает."""
+def kb_search(peer_id, query, sync=None):
+    """Найденные фрагменты (не больше /лимит чанков). Ошибку базы знаний пробрасывает.
+    sync — какой индекс: по умолчанию sync_kb (/раг), для /раг2 — sync_kb2."""
     k = chunks_limit(peer_id)
-    hits = sync_kb().search(query, k=k) if query.strip() else []
+    hits = (sync or sync_kb)().search(query, k=k) if query.strip() else []
     log.info("peer=%s: поиск в базе знаний «%s» — найдено фрагментов: %d (лимит %d)", peer_id,
              shorten(query, 100), len(hits), k)
     return hits
 
 
 @traced
-def cmd_rag(req, query):
+def cmd_rag(req, query, sync=None, status=None):
     """«/раг вопрос»: разовый ответ строго по найденным фрагментам книг; ничего не нашлось —
-    служебное сообщение «В базе знаний ничего не нашлось.», без выдумок."""
+    служебное сообщение «В базе знаний ничего не нашлось.», без выдумок.
+    «/раг2 вопрос» — то же самое по индексу пересказов (sync=sync_kb2)."""
     peer_id = req.peer_id
+    sync = sync or sync_kb
     if not query:
         query = quoted_content(req.message)[0].strip()
     try:
-        kb = sync_kb()
+        kb = sync()
     except Exception as e:
         log.exception("база знаний: %s", e)
         send_system(peer_id, f"База знаний недоступна: {e}", reply_to_msg=req.message)
         return
     if not query:
-        send_system(peer_id, rag_status_text(kb, peer_id), reply_to_msg=req.message)
+        send_system(peer_id, (status or rag_status_text)(kb, peer_id), reply_to_msg=req.message)
         return
 
     def produce():
-        hits = kb_search(peer_id, query)
+        hits = kb_search(peer_id, query, sync)
         if not hits:
             raise NoAnswer(RAG_NOTHING_FOUND)
         system, prompt = rag.build_prompt(query, hits, RAG_MAX_CONTEXT_CHARS)
@@ -2691,21 +2895,22 @@ def cmd_rag(req, query):
 
 
 def rag_query(requests):
-    """Текст для поиска в базе знаний: новые сообщения без обращения «Грань,»."""
+    """Текст для поиска в базе знаний: новые сообщения без обращения «<Имя>,»."""
     return "\n".join(ADDRESS_PREFIX_RE.sub("", r.text, count=1) for r in requests).strip()
 
 
 @traced
-def rag_mode_answer(peer_id, requests, ctx_rows, images):
+def rag_mode_answer(peer_id, requests, ctx_rows, images, sync=None):
     """
     Режим «/раг вкл» — последовательная генерация:
     1) поиск в базе знаний по новым сообщениям (не больше /лимит чанков фрагментов);
     2) нашлось — ответ только по фрагментам (с номерами и источниками);
     3) не нашлось или во фрагментах ответа нет (модель ответила НЕТ_ОТВЕТА) —
        «Поиск по базе знаний не дал результата.» и обычный ответ по истории беседы.
+    Режим «/раг2 вкл» — то же самое по индексу пересказов (sync=sync_kb2).
     """
     try:
-        hits = kb_search(peer_id, rag_query(requests))
+        hits = kb_search(peer_id, rag_query(requests), sync)
     except Exception as e:
         log.exception("база знаний: %s — отвечаю без неё", e)
         hits = []
@@ -2739,13 +2944,30 @@ def remember_content(req, text_arg):
     return (text_arg or "").strip()
 
 
+def mirror_reflection(text):
+    """Та же рефлексия — и в базе знаний /раг2 (пересказ её новых фрагментов будет получен в фоне).
+    Сбой не мешает основной записи: возвращает примечание для ответа (или пустую строку)."""
+    try:
+        os.makedirs(RAG2_DIR, exist_ok=True)
+        path = os.path.join(RAG2_DIR, REMEMBER_FILE)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        get_kb2().index_file(REMEMBER_FILE)
+        return ""
+    except Exception as e:
+        log.exception("РАГ2: копия %s: %s", REMEMBER_FILE, e)
+        return f" В базу знаний /раг2 записать не удалось: {e}"
+
+
 @traced
 def cmd_remember(req, text_arg, reset=False):
     """Атомарная запись: дописать по умолчанию, заменить только по «с нуля»."""
     peer_id = req.peer_id
     content = remember_content(req, text_arg)
     if not content:
-        send_system(peer_id, f"Что запомнить? Перешлите сообщения с текстом «Грань, запомни» "
+        send_system(peer_id, f"Что запомнить? Перешлите сообщения с текстом «{GROUP_TITLE}, запомни» "
                              f"(или напишите текст после «запомни») — он дополнит {REMEMBER_FILE} "
                              "в базе знаний.", reply_to_msg=req.message)
         return
@@ -2759,6 +2981,7 @@ def cmd_remember(req, text_arg, reset=False):
     if os.path.exists(path):
         os.replace(path, path + ".bak")       # прежняя версия — на всякий случай
     os.replace(tmp, path)
+    mirror_note = mirror_reflection(combined)
     try:
         chunks = get_kb().index_file(REMEMBER_FILE)
     except Exception as e:
@@ -2770,7 +2993,7 @@ def cmd_remember(req, text_arg, reset=False):
     log.info("peer=%s: %s %s (%d символов, %d фрагментов) от %s", peer_id, REMEMBER_FILE, action,
              len(content), chunks, req.from_id)
     send_system(peer_id, f"Запомнила: {REMEMBER_FILE} {action} ({len(content)} символов, "
-                         f"{chunks} фрагментов в базе знаний).", reply_to_msg=req.message)
+                         f"{chunks} фрагментов в базе знаний).{mirror_note}", reply_to_msg=req.message)
 
 
 @traced
@@ -2829,6 +3052,8 @@ def answer_batch(peer_id, requests):
             if len(images) >= MAX_IMAGES_PER_REQUEST:
                 break
             images.extend(row[5])
+        if rag2_mode(peer_id):
+            return rag_mode_answer(peer_id, requests, ctx_rows, images, sync=sync_kb2)
         if rag_mode(peer_id):
             return rag_mode_answer(peer_id, requests, ctx_rows, images)
         return ask_gran(peer_id, requests, ctx_rows, images)
@@ -2918,18 +3143,6 @@ def handle_event(event):
 
 
 # ============ Main ============
-def load_env():
-    """.env рядом с ботом, затем в текущей папке, затем от bot8, bot6 и bot5."""
-    from dotenv import load_dotenv
-    for path in (os.path.join(BOT_DIR, ".env"), None, os.path.join(BOT_DIR, "..", "bot8", ".env"),
-                 os.path.join(BOT_DIR, "..", "bot6", ".env"),
-                 os.path.join(BOT_DIR, "..", "bot5", ".env")):
-        if path is None:
-            load_dotenv()
-        elif os.path.exists(path):
-            load_dotenv(path)
-
-
 def init():
     """Подключение к БД, ВК и LLM. Импорты здесь, чтобы тесты не требовали токенов."""
     global DB, vk, llm_client, BOT_GROUP_ID, VK_USER_TOKEN, ADMIN_IDS
@@ -2954,6 +3167,12 @@ def init():
                  RAG_DIR, st["ok"], st["chunks"], len(st["errors"]), st["lemmatizer"], st["embeddings"])
     except Exception as e:
         log.exception("база знаний: %s", e)
+    try:
+        st = sync_kb2().stats()
+        log.info("База знаний РАГ2 %s: книг %d, фрагментов %d, с пересказом %d, в очереди %d, ошибок %d (векторы: %s)",
+                 RAG2_DIR, st["ok"], st["chunks"], st["summarized"], st["pending"], len(st["errors"]), st["embeddings"])
+    except Exception as e:
+        log.exception("база знаний РАГ2: %s", e)
     session = vk_api.VkApi(token=os.getenv("VK_TOKEN"))
     vk = session.get_api()
     llm_client = OpenAI(api_key=os.getenv("PROXYAPI_KEY"), base_url=PROXYAPI_BASE_URL)
@@ -3055,7 +3274,7 @@ def start_terminal_stop():
 
 
 def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description="Бот «Грань» для чата сообщества ВКонтакте")
+    ap = argparse.ArgumentParser(description=f"Бот «{GROUP_TITLE}» для чата сообщества ВКонтакте")
     ap.add_argument("--debug", action="store_true",
                     help="подробный лог основных функций (то же — переменная окружения BOT_DEBUG=1)")
     ap.add_argument("--log-file", help="писать лог ещё и в этот файл")
@@ -3081,6 +3300,7 @@ def main(argv=None):
     started = time.time()
     longpoll = init()
     load_history()
+    rag2_thread = start_rag2_worker()
     terminal = TERMINAL_STOP and not args.no_terminal_stop and start_terminal_stop()
     log.info("Слушаем Long Poll... (для остановки: '%s' от админа%s)%s%s", STOP_PHRASE,
              " или 0 + Enter в терминале" if terminal else "",
@@ -3117,7 +3337,9 @@ def main(argv=None):
             STOP_REQUESTED = True
 
     log.info("Бот остановлен.")
-    for closable in (KB, DB):
+    if rag2_thread:
+        rag2_thread.join(timeout=2)     # дожидаемся, если не занят запросом к API (поток фоновый)
+    for closable in (KB, KB2, DB):
         try:
             if closable is not None:
                 closable.close()

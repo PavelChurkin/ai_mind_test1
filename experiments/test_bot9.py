@@ -17,6 +17,7 @@ from datetime import datetime
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT9_DIR = os.path.join(HERE, "..", "Прочее", "bot9")
 
+os.environ["GROUP_NAME"] = "грань"     # унаследованные сценарии пишут боту «Грань, …»; чужой .env не мешает
 spec = importlib.util.spec_from_file_location("bot9", os.path.join(BOT9_DIR, "bot9.py"))
 bot9 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bot9)
@@ -141,6 +142,9 @@ class Bot9Case(unittest.TestCase):
         bot9.RAG_DIR = os.path.join(self.tmp.name, "RAG")
         bot9.RAG_INDEX_PATH = os.path.join(self.tmp.name, "rag_index.db")
         bot9.KB = None
+        bot9.RAG2_DIR = os.path.join(self.tmp.name, "RAG2")
+        bot9.RAG2_INDEX_PATH = os.path.join(self.tmp.name, "rag2_index.db")
+        bot9.KB2 = None
         self.cmid = 0
 
     def tearDown(self):
@@ -148,6 +152,9 @@ class Bot9Case(unittest.TestCase):
         if bot9.KB is not None:
             bot9.KB.close()
             bot9.KB = None
+        if bot9.KB2 is not None:
+            bot9.KB2.close()
+            bot9.KB2 = None
         self.tmp.cleanup()
 
     def tick(self, sec):
@@ -207,8 +214,9 @@ class TestPrivateAndAdmins(Bot9Case):
 class TestHelp(Bot9Case):
     def test_help_lists_all_commands_with_rights(self):
         self.say("/помощь")
-        text = self.sent()[0]
-        self.assertTrue(text.startswith(bot9.SYSTEM_MARK))
+        # с командами /раг2 справка длиннее одного сообщения ВК и приходит частями
+        self.assertTrue(all(part.startswith(bot9.SYSTEM_MARK) for part in self.sent()))
+        text = "\n".join(self.sent())
         for cmd in ("/пересказ N", "/пересказ N от", "/мысль", "/мысль подробно", "/пауза",
                     "/забудь", "/роль", "/помощь", "/лимит токенов", "/лимит символов",
                     "/сбросить лимит сообщений", "Грань, стоп машина"):

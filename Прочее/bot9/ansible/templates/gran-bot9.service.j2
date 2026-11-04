@@ -1,6 +1,6 @@
 # {{ ansible_managed }}
 [Unit]
-Description=Бот «Грань» (bot9) для ВКонтакте
+Description=Бот «{{ bot9_group_name }}» (bot9) для ВКонтакте
 Wants=network-online.target
 After=network-online.target
 
@@ -11,7 +11,7 @@ Group={{ bot9_user }}
 WorkingDirectory={{ bot9_dir }}
 Environment=PYTHONUNBUFFERED=1
 ExecStart={{ bot9_home }}/venv/bin/python {{ bot9_dir }}/bot9_server.py --restart-days {{ bot9_restart_days }}{{ ' --debug' if bot9_debug | bool else '' }}
-# «Грань, стоп машина» — бот и сервер выходят с кодом 0, systemd их не поднимает
+# «{{ bot9_group_name }}, стоп машина» — бот и сервер выходят с кодом 0, systemd их не поднимает
 # (запустить снова: systemctl start {{ bot9_service }}); падение — перезапуск.
 Restart=on-failure
 RestartSec=10
