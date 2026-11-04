@@ -2,7 +2,7 @@
 Новое в bot9 (задача #21): команды /раг2 рядом с неизменным /раг и название группы из .env.
 ВК, БЯМ и эмбеддинги подменены, сеть не нужна.
 
-Запуск: python3 -m unittest experiments/test_bot9_new.py -v
+Запуск: python3 experiments/test_bot9_new.py -v
 """
 import importlib.util
 import os

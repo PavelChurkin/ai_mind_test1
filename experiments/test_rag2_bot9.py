@@ -2,7 +2,7 @@
 Тесты Прочее/bot9/rag2.py (задача #21): иерархический пересказ (Parent-Child / Summary Retrieval).
 БЯМ и эмбеддинги подменены, сеть не нужна.
 
-Запуск: python3 -m unittest experiments/test_rag2_bot9.py -v
+Запуск: python3 experiments/test_rag2_bot9.py -v
 """
 import os
 import sys
