@@ -1,0 +1,214 @@
+---
+# Установка бота группы (bot9) на чистый сервер с Linux (Debian/Ubuntu, а также RHEL/Rocky/Alma/Fedora).
+#
+#   ansible-playbook -i inventory.ini playbook.yml -e @secrets.yml --ask-vault-pass
+#
+# Что делает:
+#   * ставит python3 (даже если на сервере его нет — через raw), venv, git;
+#   * создаёт системного пользователя bot9_user и папку bot9_home;
+#   * кладёт код бота: из этой папки (bot9_source: local) или клоном репозитория (bot9_source: git);
+#   * создаёт виртуальное окружение и ставит requirements.txt;
+#   * пишет .env с токенами и названием группы (права 600) и, если указано, копирует книги в RAG и RAG2;
+#   * ставит службу systemd (bot9_server.py: перезапуск раз в bot9_restart_days суток с очисткой логов,
+#     после падения — systemd перезапускает) и запускает её.
+# Повторный запуск обновляет код и зависимости и перезапускает бота; база gran9.db, индекс
+# базы знаний и логи сохраняются.
+- name: Бот группы ВКонтакте (bot9)
+  hosts: bot9
+  become: true
+  gather_facts: false
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    bot9_user: gran
+    bot9_home: /opt/gran
+    bot9_source: local            # local — файлы из этой папки; git — клон bot9_git_repo
+    bot9_git_repo: https://github.com/PavelChurkin/ai_mind_test1.git
+    bot9_git_version: main
+    bot9_local_dir: "{{ playbook_dir }}/.."
+    bot9_files:                   # что копируется при bot9_source: local
+      - bot9.py
+      - bot9_server.py
+      - filosof.py
+      - rag.py
+      - rag2.py
+      - requirements.txt
+      - nouns.json
+      - verbs.json
+      - adject.json
+      - Роль.txt
+    bot9_group_name: грань        # название группы: на него откликается бот (GROUP_NAME в .env)
+    bot9_rag_src: ""              # папка с книгами на машине, откуда запускается Ansible ("" — не копировать)
+    bot9_rag2_src: ""             # то же для базы знаний с пересказами (/раг2)
+    bot9_restart_days: 7
+    bot9_debug: false
+    bot9_timezone: ""             # например Europe/Moscow ("" — не менять)
+    bot9_service: gran-bot9
+    bot9_manage_service: true     # false — только файлы (например, в контейнере без systemd)
+    # Секреты — в secrets.yml (см. secrets.example.yml), лучше зашифровать: ansible-vault encrypt secrets.yml
+    vk_group_id: ""
+    vk_token: ""
+    proxyapi_key: ""
+    admin_ids: ""
+    vk_user_token: ""
+
+  tasks:
+    # Ansible нужен python3 на сервере, become — sudo, а become_user (непривилегированный
+    # пользователь) — acl; на чистом сервере их может не быть. raw работает без них.
+    - name: Python 3, sudo и acl для Ansible
+      ansible.builtin.raw: >-
+        S=""; [ "$(id -u)" = 0 ] || S=sudo;
+        if test -x /usr/bin/python3 && command -v sudo >/dev/null && command -v setfacl >/dev/null; then exit 0; fi;
+        echo installing;
+        if command -v apt-get >/dev/null; then
+        $S apt-get update -q && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3 sudo acl;
+        elif command -v dnf >/dev/null; then $S dnf install -y -q python3 sudo acl;
+        else $S yum install -y -q python3 sudo acl; fi
+      become: false
+      register: bot9_bootstrap
+      changed_when: "'installing' in bot9_bootstrap.stdout"
+
+    - name: Сведения о сервере
+      ansible.builtin.setup:
+
+    - name: Заданы токены и ID сообщества
+      ansible.builtin.assert:
+        that:
+          - vk_group_id | string | length > 0
+          - vk_token | length > 0
+          - proxyapi_key | length > 0
+          - bot9_source in ['local', 'git']
+        fail_msg: "Нужны vk_group_id, vk_token, proxyapi_key (см. secrets.example.yml); bot9_source — local или git."
+        quiet: true
+
+    - name: Пакеты (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name: [python3, python3-venv, python3-pip, git, ca-certificates, tzdata]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_facts.os_family == 'Debian'
+
+    - name: Пакеты (RHEL/Fedora)
+      ansible.builtin.dnf:
+        name: [python3, python3-pip, git, ca-certificates, tzdata]
+        state: present
+      when: ansible_facts.os_family == 'RedHat'
+
+    - name: Часовой пояс
+      ansible.builtin.command: timedatectl set-timezone {{ bot9_timezone }}
+      when: bot9_timezone | length > 0 and ansible_facts.date_time.tz != bot9_timezone
+      changed_when: true
+
+    - name: Пользователь {{ bot9_user }}
+      ansible.builtin.user:
+        name: "{{ bot9_user }}"
+        system: true
+        home: "{{ bot9_home }}"
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Папка {{ bot9_home }}
+      ansible.builtin.file:
+        path: "{{ bot9_home }}"
+        state: directory
+        owner: "{{ bot9_user }}"
+        group: "{{ bot9_user }}"
+        mode: "0750"
+
+    - name: Папка бота
+      ansible.builtin.set_fact:
+        bot9_dir: "{{ bot9_home ~ '/repo/Прочее/bot9' if bot9_source == 'git' else bot9_home ~ '/bot9' }}"
+
+    - name: Код бота — клон репозитория
+      ansible.builtin.git:
+        repo: "{{ bot9_git_repo }}"
+        version: "{{ bot9_git_version }}"
+        dest: "{{ bot9_home }}/repo"
+        force: false              # база, индекс, логи и .env не в git — не трогаются
+      become_user: "{{ bot9_user }}"
+      when: bot9_source == 'git'
+      notify: Перезапустить бота
+
+    - name: Папка с кодом бота
+      ansible.builtin.file:
+        path: "{{ bot9_dir }}"
+        state: directory
+        owner: "{{ bot9_user }}"
+        group: "{{ bot9_user }}"
+        mode: "0750"
+      when: bot9_source == 'local'
+
+    - name: Код бота — файлы из этой папки
+      ansible.builtin.copy:
+        src: "{{ bot9_local_dir }}/{{ item }}"
+        dest: "{{ bot9_dir }}/{{ item }}"
+        owner: "{{ bot9_user }}"
+        group: "{{ bot9_user }}"
+        mode: "0640"
+      loop: "{{ bot9_files }}"
+      when: bot9_source == 'local'
+      notify: Перезапустить бота
+
+    - name: Виртуальное окружение и зависимости
+      ansible.builtin.pip:
+        requirements: "{{ bot9_dir }}/requirements.txt"
+        virtualenv: "{{ bot9_home }}/venv"
+        virtualenv_command: python3 -m venv
+      become_user: "{{ bot9_user }}"
+      notify: Перезапустить бота
+
+    - name: Токены (.env)
+      ansible.builtin.template:
+        src: env.j2
+        dest: "{{ bot9_dir }}/.env"
+        owner: "{{ bot9_user }}"
+        group: "{{ bot9_user }}"
+        mode: "0600"
+      no_log: true
+      notify: Перезапустить бота
+
+    - name: Книги базы знаний (RAG)
+      ansible.builtin.copy:
+        src: "{{ bot9_rag_src }}/"
+        dest: "{{ bot9_dir }}/RAG/"
+        owner: "{{ bot9_user }}"
+        group: "{{ bot9_user }}"
+        mode: "0640"
+        directory_mode: "0750"
+      when: bot9_rag_src | length > 0
+      notify: Перезапустить бота
+
+    - name: Книги базы знаний с пересказами (RAG2)
+      ansible.builtin.copy:
+        src: "{{ bot9_rag2_src }}/"
+        dest: "{{ bot9_dir }}/RAG2/"
+        owner: "{{ bot9_user }}"
+        group: "{{ bot9_user }}"
+        mode: "0640"
+        directory_mode: "0750"
+      when: bot9_rag2_src | length > 0
+      notify: Перезапустить бота
+
+    - name: Служба systemd
+      ansible.builtin.template:
+        src: gran-bot9.service.j2
+        dest: /etc/systemd/system/{{ bot9_service }}.service
+        mode: "0644"
+      notify: Перезапустить бота
+
+    - name: Служба включена и запущена
+      ansible.builtin.systemd_service:
+        name: "{{ bot9_service }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: bot9_manage_service | bool
+
+  handlers:
+    - name: Перезапустить бота
+      ansible.builtin.systemd_service:
+        name: "{{ bot9_service }}"
+        state: restarted
+        daemon_reload: true
+      when: bot9_manage_service | bool

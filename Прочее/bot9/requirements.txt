@@ -1,0 +1,13 @@
+# бот
+vk_api
+openai
+python-dotenv
+certifi
+# база знаний (rag.py)
+pymorphy3          # леммы русских слов; без него — snowballstemmer, без того — слова как есть
+pypdf              # .pdf с текстовым слоем
+olefile            # .doc (Word 97–2003)
+# необязательно:
+# snowballstemmer        # запасной вариант, если pymorphy3 не ставится
+# sentence-transformers  # векторный поиск /раг (RAG_EMBEDDINGS = True), ~0,5 ГБ с torch
+# numpy                  # быстрее сравнивает векторы; для /раг2 с большими книгами

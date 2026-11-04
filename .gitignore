@@ -42,4 +42,11 @@ analyze.txt
 Прочее/bot8/RAG/
 Прочее/bot8/ansible/inventory.ini
 Прочее/bot8/ansible/secrets.yml
+
+# bot9: runtime data and deployment secrets
+Прочее/bot9/logs/
+Прочее/bot9/RAG/
+Прочее/bot9/RAG2/
+Прочее/bot9/ansible/inventory.ini
+Прочее/bot9/ansible/secrets.yml
 ci-logs/
